@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>海啸模拟实验室 · Tsunami Lab</title>
+    <style>
+      * { box-sizing: border-box; }
+      html, body, #app {
+        margin: 0; padding: 0; width: 100%; height: 100%;
+        overflow: hidden; background: #05080f;
+        font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      }
+      #app canvas { display: block; }
+
+      .hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; color: #cfe3f5; }
+
+      .hud .header {
+        position: absolute; top: 16px; left: 20px;
+      }
+      .hud h1 {
+        margin: 0; font-size: 20px; font-weight: 600; letter-spacing: 1px;
+        color: #eaf4ff; text-shadow: 0 2px 8px rgba(0,0,0,.6);
+      }
+
+      .hud .stats {
+        position: absolute; top: 52px; left: 20px; font-size: 13px;
+        background: rgba(8, 16, 28, .55); border: 1px solid rgba(120, 180, 240, .18);
+        border-radius: 8px; padding: 8px 12px; line-height: 1.9; min-width: 190px;
+        backdrop-filter: blur(4px);
+      }
+      .hud .stats b { color: #7fd4ff; font-variant-numeric: tabular-nums; }
+
+      .hud .legend {
+        position: absolute; left: 20px; bottom: 44px; display: flex; align-items: center;
+        gap: 8px; font-size: 12px; color: #9cc6ee;
+      }
+
+      .hud .observers {
+        position: absolute; left: 20px; bottom: 78px; font-size: 12px;
+        background: rgba(8, 16, 28, .55); border: 1px solid rgba(120, 180, 240, .18);
+        border-radius: 8px; padding: 6px 10px; backdrop-filter: blur(4px);
+        max-height: 34vh; overflow-y: auto;
+      }
+      .hud .observers .ob-title { color: #9cc6ee; font-size: 11px; margin-bottom: 4px; }
+      .hud .observers table { border-collapse: collapse; }
+      .hud .observers td {
+        padding: 1px 10px 1px 0; white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
+      .hud .observers td.ob-name { color: #cfe3f5; }
+      .hud .observers td.ob-val { color: #7fd4ff; text-align: right; }
+      .hud .legend .bar {
+        width: 180px; height: 10px; border-radius: 5px;
+        background: linear-gradient(90deg,
+          rgb(5, 41, 115) 0%, rgb(13, 115, 166) 50%, rgb(250, 92, 31) 100%);
+        border: 1px solid rgba(255,255,255,.15);
+      }
+
+      .hud .footer {
+        position: absolute; left: 20px; right: 20px; bottom: 12px;
+        font-size: 11px; color: rgba(160, 190, 220, .55);
+      }
+
+      .hud .hint {
+        position: absolute; right: 20px; bottom: 44px; font-size: 12px;
+        color: #9cc6ee; text-align: right; line-height: 1.8;
+        text-shadow: 0 1px 4px rgba(0,0,0,.8);
+      }
+
+      #fatal {
+        position: fixed; inset: 0; display: none; place-items: center; z-index: 100;
+        background: rgba(5, 8, 15, .92); color: #ffb4a2; font-size: 15px;
+        text-align: center; padding: 40px; line-height: 2;
+      }
+
+      /* 震源触发倒计时 */
+      #countdown {
+        position: fixed; inset: 0; display: none; place-items: center; z-index: 20;
+        pointer-events: none; font-size: 120px; font-weight: 700; color: #ffd166;
+        text-shadow: 0 4px 24px rgba(0,0,0,.75);
+        font-variant-numeric: tabular-nums;
+      }
+      #countdown.show { display: grid; }
+
+      /* ---------------- 移动端适配 ---------------- */
+      @media (max-width: 760px) {
+        .hud .header { top: 10px; left: 12px; }
+        .hud h1 { font-size: 15px; }
+        .hud .stats {
+          top: 36px; left: 12px; font-size: 11px;
+          padding: 6px 10px; min-width: 150px; line-height: 1.7;
+        }
+        .hud .legend { left: 12px; bottom: 26px; font-size: 10px; }
+        .hud .observers {
+          left: 12px; bottom: 52px; font-size: 10px; padding: 4px 8px;
+          max-height: 24vh;
+        }
+        .hud .observers td { padding-right: 6px; }
+        .hud .legend .bar { width: 110px; }
+        .hud .legend .caption { display: none; }
+        .hud .footer {
+          left: 12px; right: 12px; bottom: 8px; font-size: 9px;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .hud .hint { display: none; }
+        #countdown { font-size: 72px; }
+        /* lil-gui 控制台:窄屏收窄,避免遮挡地球 */
+        .lil-gui { --width: 210px; --font-size: 11px; }
+      }
+      @media (max-width: 480px) {
+        .lil-gui { --width: 178px; }
+        .hud .stats { min-width: 0; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+
+    <div class="hud">
+      <div class="header">
+        <h1>海啸模拟实验室</h1>
+      </div>
+
+      <div class="stats">
+        模拟时间&nbsp;&nbsp;<b id="stat-time">00:00</b><br />
+        峰值波高&nbsp;&nbsp;<b id="stat-peak">--</b><br />
+        当前区域&nbsp;&nbsp;<b id="stat-region" style="font-size:11px">程序化理想地形</b><br />
+        帧率&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b id="stat-fps">--</b>
+      </div>
+
+      <div class="observers" id="observer-panel" style="display:none">
+        <div class="ob-title">观测点 · 到达时间 / 峰值波高</div>
+        <table id="observer-table"></table>
+      </div>
+
+      <div class="legend">
+        <span id="legend-min">-2 m</span>
+        <div class="bar"></div>
+        <span id="legend-max">+2 m</span>
+        <span class="caption" style="margin-left:8px;opacity:.7">海面位移色标</span>
+      </div>
+
+      <div class="hint">
+        点击海面任意位置触发海底地震<br />
+        拖拽旋转视角 · 滚轮缩放
+      </div>
+
+      <div class="footer">
+        本软件仅用于教学演示:采用线性浅水方程与理想化地形,波形垂直方向经过夸张处理,不可用于真实海啸预警或工程评估。
+      </div>
+    </div>
+
+    <div id="countdown"></div>
+
+    <div id="fatal"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

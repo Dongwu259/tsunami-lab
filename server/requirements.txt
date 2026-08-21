@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn>=0.29
+numpy>=1.26
+# 科研级求解后端(需要 gfortran 编译环境):
+#   pip install clawpack

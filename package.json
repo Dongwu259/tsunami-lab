@@ -1,0 +1,29 @@
+{
+  "name": "tsunami-lab",
+  "version": "0.1.0",
+  "description": "教学级可视化海啸模拟实验室(WebGL2 浅水方程)",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "author": "Dongwu259",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Dongwu259/tsunami-lab.git"
+  },
+  "scripts": {
+    "dev": "vite",
+    "check": "tsc --noEmit",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "lil-gui": "^0.19.2",
+    "three": "^0.160.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/three": "^0.160.0",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.11"
+  }
+}

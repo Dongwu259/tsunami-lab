@@ -1,0 +1,9 @@
+node_modules
+dist
+.DS_Store
+*.local
+
+# Python / GeoClaw 后端产物
+__pycache__/
+*.pyc
+server/_jobs/
