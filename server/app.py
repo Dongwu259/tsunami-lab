@@ -31,7 +31,7 @@ from . import geoclaw_runner as runner
 JOBS_DIR = Path(__file__).resolve().parent / "_jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="tsunami-lab GeoClaw backend", version="0.2.0")
+app = FastAPI(title="tsunami-lab GeoClaw backend", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

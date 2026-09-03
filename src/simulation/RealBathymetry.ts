@@ -1,13 +1,20 @@
 import { MAX_GRID, kmPerDegLon, KM_PER_DEG_LAT } from '../config';
 
 /**
- * .tsunami 二进制格式(小端):
- *   magic 'TSNB' | u16 版本 | u32 宽 | u32 高
- *   | f64 西 | f64 东 | f64 南 | f64 北
- *   | char[32] 数据源名 | float32[宽×高] 高程(米,行主序,自南向北)
+ * .tsunami 二进制格式(小端),头部共 78 字节:
+ *   magic 'TSNB'(4) | u16 版本(2) | u32 宽(4) | u32 高(4)
+ *   | f64 西(8) | f64 东(8) | f64 南(8) | f64 北(8)
+ *   | char[32] 数据源名(32) | float32[宽×高] 高程(米,行主序,自南向北)
+ * 高程数据紧随 78 字节头之后;读取偏移必须与写入端 tools/fetch_bathy.py 一致。
  */
 
 const MAGIC = 0x424e5354; // 'TSNB' 小端
+
+/** 头部字节数:4 + 2 + 4 + 4 + 8×4 + 32 = 78,高程数据从此偏移开始 */
+const HEADER_BYTES = 78;
+/** 数据源名在头部中的偏移与长度(char[32]) */
+const NAME_OFFSET = 46;
+const NAME_LEN = 32;
 
 export interface RealRegion {
   /** 源网格尺寸 */
@@ -38,7 +45,7 @@ export interface RegionGeometry {
 /** 解析 .tsunami 二进制;格式非法时抛错 */
 export function parseTsunamiBinary(buf: ArrayBuffer): RealRegion {
   const view = new DataView(buf);
-  if (buf.byteLength < 54 || view.getUint32(0, true) !== MAGIC) {
+  if (buf.byteLength < HEADER_BYTES || view.getUint32(0, true) !== MAGIC) {
     throw new Error('不是有效的 .tsunami 地形文件');
   }
   const version = view.getUint16(4, true);
@@ -52,17 +59,19 @@ export function parseTsunamiBinary(buf: ArrayBuffer): RealRegion {
   const south = view.getFloat64(30, true);
   const north = view.getFloat64(38, true);
 
-  const nameBytes = new Uint8Array(buf, 46, 32);
+  const nameBytes = new Uint8Array(buf, NAME_OFFSET, NAME_LEN);
   const end = nameBytes.indexOf(0);
   const source = new TextDecoder().decode(
-    nameBytes.subarray(0, end < 0 ? 32 : end)
+    nameBytes.subarray(0, end < 0 ? NAME_LEN : end)
   );
 
-  const expected = 54 + width * height * 4;
+  const expected = HEADER_BYTES + width * height * 4;
   if (buf.byteLength < expected) {
     throw new Error('文件损坏:数据长度不足');
   }
-  const grid = new Float32Array(buf.slice(54, 54 + width * height * 4));
+  const grid = new Float32Array(
+    buf.slice(HEADER_BYTES, HEADER_BYTES + width * height * 4)
+  );
 
   return { width, height, west, east, south, north, source, grid };
 }

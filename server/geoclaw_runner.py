@@ -21,6 +21,10 @@ from pathlib import Path
 
 import numpy as np
 
+# .tsunami 头部字节数:magic4 + version2 + nx4 + ny4 + 4×f64(32) + name[32] = 78,
+# 高程数据从此偏移开始(必须与写入端 tools/fetch_bathy.py 一致)。
+HEADER_BYTES = 78
+
 # ---------------------------------------------------------------- 环境检测
 
 
@@ -49,7 +53,9 @@ def tsunami_to_topofile(tsunami_path: Path, out_path: Path) -> dict:
     buf = tsunami_path.read_bytes()
     version, nx, ny = struct.unpack_from("<HII", buf, 4)
     west, east, south, north = struct.unpack_from("<dddd", buf, 14)
-    grid = np.frombuffer(buf[54 : 54 + nx * ny * 4], dtype="<f4").reshape(ny, nx)
+    grid = np.frombuffer(
+        buf[HEADER_BYTES : HEADER_BYTES + nx * ny * 4], dtype="<f4"
+    ).reshape(ny, nx)
 
     cell_x = (east - west) / (nx - 1)
     cell_y = (north - south) / (ny - 1)

@@ -286,6 +286,7 @@ def write_tsunami(path, grid, west, east, south, north, name):
     ny, nx = grid.shape
     name_bytes = name.encode("utf-8")[:32].ljust(32, b"\0")
     with open(path, "wb") as f:
+        # 头部共 78 字节:magic(4) + <HII>(10) + <dddd>(32) + name(32);随后是 float32 高程
         f.write(MAGIC)
         f.write(struct.pack("<HII", VERSION, nx, ny))
         f.write(struct.pack("<dddd", west, east, south, north))
