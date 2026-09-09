@@ -10,6 +10,9 @@
 
 ## 效果展示
 
+![3D 全球地球模式](docs/screenshots/showcase-globe.png)
+*3D 全球地球球面模拟:等距圆柱投影 ±84°,真实地形上由东北海域 Mw9.0 震源场激发的球面海啸波纹*
+
 | | |
 |:---:|:---:|
 | ![震源双极波场](docs/screenshots/showcase-wavefield.png) | ![跨域传播](docs/screenshots/showcase-propagation.png) |
