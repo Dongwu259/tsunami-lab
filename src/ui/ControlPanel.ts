@@ -6,6 +6,8 @@ export interface SimParams {
   playing: boolean;
   /** 时间倍速:相对真实时间的倍数(1 = 实时) */
   timeScale: number;
+  /** 数值格式:'v2' = MUSCL-RK2(二阶),'lf' = Lax–Friedrichs(一阶对照) */
+  scheme: string;
   exaggeration: number;
   colorRange: number;
   waterOpacity: number;
@@ -30,6 +32,7 @@ export interface SimParams {
 
 export interface PanelCallbacks {
   onReset(): void;
+  onSchemeChange(scheme: string): void;
   onRandomQuake(): void;
   onTohokuQuake(): void;
   onExaggerationChange(ex: number): void;
@@ -69,6 +72,7 @@ export function createPanel(cb: PanelCallbacks): PanelHandle {
   const params: SimParams = {
     playing: true,
     timeScale: DEFAULT_TIME_SCALE,
+    scheme: 'v2',
     exaggeration: 3,
     colorRange: 2,
     waterOpacity: 0.8,
@@ -100,6 +104,13 @@ export function createPanel(cb: PanelCallbacks): PanelHandle {
       '32×': 32, '64×': 64, '128×': 128, '256×': 256, '512×': 512,
     })
     .name('时间倍速(相对实时)');
+  sim
+    .add(params, 'scheme', {
+      'MUSCL-RK2(二阶低耗散)': 'v2',
+      'Lax–Friedrichs(一阶对照)': 'lf',
+    })
+    .name('数值格式')
+    .onChange((v: string) => cb.onSchemeChange(v));
   sim.add({ reset: cb.onReset }, 'reset').name('重置海面');
 
   // --- 地震源 ---

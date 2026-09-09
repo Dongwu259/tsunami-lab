@@ -13,7 +13,7 @@ import {
   LiveEarthquake,
   toLiveQuakeCatalog,
 } from './api/usgsClient';
-import { DOMAIN_KM, GLOBE_DT, GLOBE_LAT_SPAN, KM_PER_DEG_LAT, SIM_DT, SIM_SIZE, kmPerDegLon } from './config';
+import { DOMAIN_KM, GLOBE_LAT_SPAN, KM_PER_DEG_LAT, SIM_SIZE, kmPerDegLon } from './config';
 import { CatalogEarthquake, findQuake } from './data/earthquakes';
 import { ObserverSite, OBSERVER_SITES } from './data/observers';
 import { SceneApp, ViewMode } from './scene/SceneApp';
@@ -106,6 +106,9 @@ export class TsunamiApp {
     // --- 控制面板 ---
     this.panel = createPanel({
       onReset: () => this.resetSea(),
+      onSchemeChange: (s) => {
+        this.solver.uniforms.uScheme.value = s === 'lf' ? 0 : 1;
+      },
       onRandomQuake: () => {
         const u = 0.12 + Math.random() * 0.34;
         const v = 0.12 + Math.random() * 0.76;
@@ -140,6 +143,7 @@ export class TsunamiApp {
       onGeoSubmit: () => this.geoSubmit(),
       onGeoNextFrame: () => this.geoNextFrame(),
     });
+    this.setRegionText(`程序化理想地形 ${DOMAIN_KM}×${DOMAIN_KM} km`);
 
     // --- 点击海面触发地震(区分点击与拖拽) ---
     let downX = 0;
@@ -172,7 +176,7 @@ export class TsunamiApp {
 
   // ---------------------------------------------------------------- 地形切换
 
-  /** 用新海床重建求解器与场景域。
+  /** 用新海床重建求解器与场景域。dt 由求解器按 CFL 自动计算。
    * renderSize + hiResGrid:可选的高分辨率渲染通道(仅提升地形视觉细节,
    * 求解网格仍用降采样后的 bathy,保持计算性能) */
   private rebuild(
@@ -183,7 +187,6 @@ export class TsunamiApp {
     dyM: number,
     regionText: string,
     mode: ViewMode = 'plane',
-    dtSeconds = SIM_DT,
     renderSize?: { x: number; y: number },
     hiResGrid?: Float32Array
   ): void {
@@ -191,8 +194,10 @@ export class TsunamiApp {
     this.viewMode = mode;
     this.solver.dispose();
     this.solver = new TsunamiSolver(
-      this.renderer, bathy, sizeX, sizeY, dxM, dyM, mode === 'globe', dtSeconds
+      this.renderer, bathy, sizeX, sizeY, dxM, dyM, mode === 'globe'
     );
+    this.solver.uniforms.uScheme.value =
+      this.panel.params.scheme === 'lf' ? 0 : 1;
     // 高分辨率渲染纹理:RGBA 浮点(r = 高程),与求解器 bathyTexture 格式一致;
     // 旧纹理由 setRenderBathy 内部统一 dispose
     if (renderSize && hiResGrid) {
@@ -222,11 +227,17 @@ export class TsunamiApp {
     this.simSeconds = 0;
     this.quakeSimT = null;                 // 域切换后旧震源波圈失效
     this.sceneApp.setSeismicTime(0);
-    this.elRegion.textContent = regionText;
-    this.panel.setRegionInfo(regionText);
+    this.setRegionText(regionText);
     this.sceneApp.setEpicenterMarker(null); // 域切换后旧震源标记失效
     this.rebuildObservers(bathy);
     this.updateStats(true);
+  }
+
+  /** 区域信息行统一拼接自动 dt 显示 */
+  private setRegionText(text: string): void {
+    const full = `${text} · dt=${this.solver.dtSeconds.toFixed(2)}s(CFL 自动)`;
+    this.elRegion.textContent = full;
+    this.panel.setRegionInfo(full);
   }
 
   /** 加载随包的真实地形(2011 东北海域) */
@@ -287,7 +298,7 @@ export class TsunamiApp {
       this.rebuild(
         grid, sizeX, sizeY, dxM, dyM,
         `3D 全球地形 ±84° (求解 ${sizeX}×${sizeY} · 渲染 ${hiW}×${hiH})`,
-        'globe', GLOBE_DT,
+        'globe',
         k === 1 ? undefined : { x: hiW, y: hiH },
         k === 1 ? undefined : region.grid
       );

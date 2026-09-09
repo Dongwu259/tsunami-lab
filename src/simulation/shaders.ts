@@ -5,29 +5,27 @@
  *   ∂η/∂t  = -∇·(H·u)            连续性方程
  *   ∂(H·u)/∂t = -g·H·∇η          动量方程
  * 状态纹理:r = η(海面位移 m),g = Hu,b = Hv(深度积分通量 m²/s)。
- * 数值格式:Lax–Friedrichs(显式、无条件稳定于 CFL 之内),
- * 在 GPU 上以 ping-pong 双缓冲方式推进。
+ * 数值格式(uScheme 切换):
+ *   0 = 一阶 Lax–Friedrichs(教学对照,耗散大);
+ *   1 = MUSCL 重构 + minmod 限制器 + Rusanov 界面通量 + SSP-RK2(二阶低耗散)。
+ * 震源注入为独立 pass(INJECT_FRAG),与步进格式解耦。
  */
 
-/** 单步推进着色器(GPUComputationRenderer 变量)。
- * 注意:
- *  1. uState 由 GPUComputationRenderer 按依赖关系自动注入声明,此处不可重复声明;
- *  2. 其内置顶点着色器不输出 vUv,须用 gl_FragCoord.xy / resolution 求 uv。 */
+/** 单步推进着色器(LF 格式;手动 ping-pong 下 uState 需显式声明) */
 export const STEP_FRAG = /* glsl */ `
+uniform sampler2D uState;        // 当前状态(RK2 中为 U0)
 uniform sampler2D uBathymetry;   // 海床高程(m,负值在海面以下)
-uniform vec2  uTexel;
+uniform vec2 uTexel;
+uniform vec2 uRes;               // 网格尺寸(像素)
 uniform float uDx;               // x 方向网格边长(m)
 uniform float uDy;               // y 方向网格边长(m)
 uniform float uDt;               // 时间步长(s)
 uniform float uG;                // 重力加速度
 uniform float uDamping;          // 底摩擦阻尼系数
-uniform float uInject;           // 1 = 本子步注入震源
-uniform vec3  uSource;           // xy = 震中 uv,z = 半径(uv 单位)
-uniform float uSourceAmp;        // 初始波幅(m)
 uniform float uGlobeMode;        // 1 = 全球球面(经向周期 + 纬度度量)
 
 void main() {
-  vec2 uv = gl_FragCoord.xy / resolution.xy;
+  vec2 uv = gl_FragCoord.xy / uRes;
   float tx = uTexel.x;
   float ty = uTexel.y;
 
@@ -81,19 +79,171 @@ void main() {
   hvNew *= wet;
   etaNew = mix(c.r, etaNew, wet);
 
-  // 海底地震:海底瞬时抬升 → 海面同形位移(Okada 解的教学级近似)
-  if (uInject > 0.5) {
-    vec2 dv = uv - uSource.xy;
-    if (uGlobeMode > 0.5) {
-      // 经向环绕:取最短跨缝距离,保证 180° 经线两侧震源连续
-      dv.x -= floor(dv.x + 0.5);
-      dv.y *= 0.4667;   // 纬度范围 168°:把 v 距离折算成等效经度距离
-    }
-    float rr = uSource.z * uSource.z;
-    etaNew += uSourceAmp * exp(-dot(dv, dv) / rr);
+  gl_FragColor = vec4(etaNew, huNew, hvNew, 1.0);
+}
+`;
+
+/** MUSCL 界面通量公共代码段(与 cpuSolver.ts fluxX/fluxY 同构)。
+ * minmod 限制器 + Rusanov(局部 Lax–Friedrichs)通量,波速 s = √(g·max(HL,HR))。
+ * 线性浅水通量:Fx = (hu, g·H·η, 0),Fy = (hv, 0, g·H·η)。 */
+const FLUX_GLSL = /* glsl */ `
+uniform sampler2D uState;
+uniform sampler2D uBathymetry;
+uniform vec2 uRes;
+uniform vec2 uTexel;
+uniform float uDx;
+uniform float uDy;
+uniform float uDt;
+uniform float uG;
+uniform float uGlobeMode;
+
+float minmod(float a, float b) {
+  // 同号取绝对值较小者,异号(或含零)返回 0(与 cpuSolver.minmod 同构)
+  return (a * b <= 0.0) ? 0.0 : sign(a) * min(abs(a), abs(b));
+}
+
+// 网格索引:经向 x 周期(globe)或钳制(plane),纬向 y 始终钳制(与 CPU ix/iy 同构)
+ivec2 cellIdx(int i, int j) {
+  float nx = uRes.x;
+  float ny = uRes.y;
+  float fx = uGlobeMode > 0.5 ? mod(float(i), nx) : clamp(float(i), 0.0, nx - 1.0);
+  float fy = clamp(float(j), 0.0, ny - 1.0);
+  return ivec2(int(fx), int(fy));
+}
+
+vec4 cellState(ivec2 c) { return texture2D(uState, (vec2(c) + 0.5) * uTexel); }
+float cellDepth(ivec2 c) { return max(-texture2D(uBathymetry, (vec2(c) + 0.5) * uTexel).r, 0.0); }
+
+// x 方向界面 (i+1/2, 行 j) 通量:入参 q=(i,j),与 CPU fluxX(i,j) 同构
+vec3 musclFluxX(ivec2 q) {
+  vec4 A = cellState(cellIdx(q.x - 1, q.y));
+  vec4 B = cellState(cellIdx(q.x,     q.y));
+  vec4 C = cellState(cellIdx(q.x + 1, q.y));
+  vec4 D = cellState(cellIdx(q.x + 2, q.y));
+  float HB = cellDepth(cellIdx(q.x,     q.y));
+  float HC = cellDepth(cellIdx(q.x + 1, q.y));
+  vec3 sL = vec3(minmod(B.r - A.r, C.r - B.r), minmod(B.g - A.g, C.g - B.g), minmod(B.b - A.b, C.b - B.b));
+  vec3 sR = vec3(minmod(C.r - B.r, D.r - C.r), minmod(C.g - B.g, D.g - C.g), minmod(C.b - B.b, D.b - C.b));
+  float s = sqrt(uG * max(HB, HC));
+  float eL = B.r + 0.5 * sL.x, eR = C.r - 0.5 * sR.x;
+  float uL = B.g + 0.5 * sL.y, uR = C.g - 0.5 * sR.y;
+  float vL = B.b + 0.5 * sL.z, vR = C.b - 0.5 * sR.z;
+  return vec3(
+    0.5 * (uL + uR) - 0.5 * s * (eR - eL),
+    0.5 * uG * (HB * eL + HC * eR) - 0.5 * s * (uR - uL),
+    -0.5 * s * (vR - vL));
+}
+
+// y 方向界面 (列 i, j+1/2) 通量:入参 q=(i,j),与 CPU fluxY(i,j) 同构
+vec3 musclFluxY(ivec2 q) {
+  vec4 A = cellState(cellIdx(q.x, q.y - 1));
+  vec4 B = cellState(cellIdx(q.x, q.y));
+  vec4 C = cellState(cellIdx(q.x, q.y + 1));
+  vec4 D = cellState(cellIdx(q.x, q.y + 2));
+  float HB = cellDepth(cellIdx(q.x, q.y));
+  float HC = cellDepth(cellIdx(q.x, q.y + 1));
+  vec3 sL = vec3(minmod(B.r - A.r, C.r - B.r), minmod(B.g - A.g, C.g - B.g), minmod(B.b - A.b, C.b - B.b));
+  vec3 sR = vec3(minmod(C.r - B.r, D.r - C.r), minmod(C.g - B.g, D.g - C.g), minmod(C.b - B.b, D.b - C.b));
+  float s = sqrt(uG * max(HB, HC));
+  float eL = B.r + 0.5 * sL.x, eR = C.r - 0.5 * sR.x;
+  float uL = B.g + 0.5 * sL.y, uR = C.g - 0.5 * sR.y;
+  float vL = B.b + 0.5 * sL.z, vR = C.b - 0.5 * sR.z;
+  return vec3(
+    0.5 * (vL + vR) - 0.5 * s * (eR - eL),
+    -0.5 * s * (uR - uL),
+    0.5 * uG * (HB * eL + HC * eR) - 0.5 * s * (vR - vL));
+}
+`;
+
+/** RK2 推进着色器(uScheme=1)。uStage 切换两个 SSP-RK2 阶段:
+ *   0: U* = U + dt·L(U)              (uState = U0)
+ *   1: U' = ½U0 + ½(U* + dt·L(U*))   (uState = U*,u0 = U0)
+ * 修改项(阻尼·海绵·干单元)按算子分裂在阶段 1 合并后一次性应用,
+ * 与 cpuSolver.stepV2 同构。 */
+export const STEP_FRAG_V2 = /* glsl */ `
+${FLUX_GLSL}
+uniform float uStage;
+uniform float uDamping;
+uniform float uDiag;      // DEV 诊断:1 = 直接输出 L 算子(不推进)
+uniform sampler2D u0;   // 阶段 B 的 RK2 基态 U0
+
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec2 uv = gl_FragCoord.xy / uRes;
+
+  float bed = texture2D(uBathymetry, uv).r;
+  float H = max(-bed, 0.0);
+  float wet = step(1.0, H);
+
+  // 球面度量:经向格距随纬度收缩 + 极地 CFL 下限保护(与 LF/CPU 镜像同构)
+  float lat = (uv.y - 0.5) * 168.0;
+  float cflFloor = uDt * sqrt(uG * H) * 2.2 + 100.0;
+  float dxEff = uGlobeMode > 0.5
+      ? max(uDx * cos(max(abs(lat), 5.0) * 0.017453293), cflFloor)
+      : uDx;
+
+  // 单元 p 的四界面通量:musclFluxX(q)=界面 q.x+1/2,musclFluxY(q)=界面 q.y+1/2。
+  // 故单元 p 的左/右界面用 q=(p.x-1,p.y)/(p.x,p.y),下/上界面用 q=(p.x,p.y-1)/(p.x,p.y)。
+  vec3 fxm = musclFluxX(ivec2(p.x - 1, p.y));
+  vec3 fxp = musclFluxX(ivec2(p.x,     p.y));
+  vec3 fym = musclFluxY(ivec2(p.x, p.y - 1));
+  vec3 fyp = musclFluxY(ivec2(p.x, p.y));
+  vec3 L = -vec3(
+    (fxp.x - fxm.x) / dxEff + (fyp.x - fym.x) / uDy,
+    (fxp.y - fxm.y) / dxEff + (fyp.y - fym.y) / uDy,
+    (fxp.z - fxm.z) / dxEff + (fyp.z - fym.z) / uDy);
+
+  if (uDiag > 0.5) {
+    // 诊断:r=Lη·1e3, g=Lhu, b=Lhv, a=fxp.y-fxm.y(压力通量差)
+    gl_FragColor = vec4(L.x * 1000.0, L.y, L.z, fxp.y - fxm.y);
+    return;
   }
 
-  gl_FragColor = vec4(etaNew, huNew, hvNew, 1.0);
+  vec4 outState;
+  if (uStage < 0.5) {
+    // 阶段 A:uState = U0
+    outState = vec4(texture2D(uState, uv).rgb + uDt * L, 1.0);
+  } else {
+    // 阶段 B:uState = U*,u0 = U0
+    vec4 U0 = texture2D(u0, uv);
+    vec4 Us = texture2D(uState, uv);
+    outState = vec4(0.5 * U0.rgb + 0.5 * (Us.rgb + uDt * L), 1.0);
+    // 边界海绵:平面域四边吸收;球面仅两极吸收
+    float edge = uGlobeMode > 0.5
+        ? min(uv.y, 1.0 - uv.y)
+        : min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    float spongeWidth = uGlobeMode > 0.5 ? 0.03 : 0.06;
+    float sponge = smoothstep(0.0, spongeWidth, edge);
+    float m = uDamping * sponge * wet;
+    outState.g *= m;
+    outState.b *= m;
+    outState.r = mix(U0.r, outState.r, wet);
+  }
+  gl_FragColor = outState;
+}
+`;
+
+/** 震源注入 pass(独立于步进格式):η += 高斯型海底抬升。
+ * 读 uState(当前)、写另一缓冲后交换,避免自读自写。 */
+export const INJECT_FRAG = /* glsl */ `
+uniform sampler2D uState;
+uniform vec2 uRes;
+uniform vec3  uSource;           // xy = 震中 uv,z = 半径(uv 单位)
+uniform float uSourceAmp;        // 初始波幅(m)
+uniform float uGlobeMode;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec4 c = texture2D(uState, uv);
+  vec2 dv = uv - uSource.xy;
+  if (uGlobeMode > 0.5) {
+    // 经向环绕:取最短跨缝距离,保证 180° 经线两侧震源连续
+    dv.x -= floor(dv.x + 0.5);
+    dv.y *= 0.4667;   // 纬度范围 168°:把 v 距离折算成等效经度距离
+  }
+  float rr = uSource.z * uSource.z;
+  c.r += uSourceAmp * exp(-dot(dv, dv) / rr);
+  gl_FragColor = c;
 }
 `;
 

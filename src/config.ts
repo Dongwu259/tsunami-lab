@@ -13,18 +13,18 @@ export const DOMAIN_KM = 240;
 export const GRAVITY = 9.81;
 
 /**
- * 单个子步时间步长(s)。
- * 越接近 CFL 上限(dx/√(gH) ≈ 4.9 s),Lax–Friedrichs 格式的数值耗散越小。
+ * CFL 安全因子:dt = CFL_SAFETY·min(dx,dy)/√(g·Hmax)。
+ * 二维格式稳定条件为两方向库朗数之和 νx+νy ≤ 1,方形网格下取 0.5 即贴近上限。
  */
-export const SIM_DT = 3.0;
+export const CFL_SAFETY = 0.5;
 
-/**
- * 全球球面模式时间步长(s)。
- * 二维 LF 格式稳定条件为两方向库朗数之和 νx+νy ≤ 1:
- *   νy = dt·√(gH)/dy ≈ 0.39(最深海域),需给极地经向保护留出余量,
- *   取 50 s 而非逼近单向上限,避免长时间运行后高纬模式累积爆炸。
- */
-export const GLOBE_DT = 50.0;
+/** 由网格间距与最大水深计算稳定时间步长(s) */
+export function computeStableDt(
+  dxM: number, dyM: number, maxDepthM: number, cfl = CFL_SAFETY
+): number {
+  const c = Math.sqrt(GRAVITY * Math.max(maxDepthM, 1));
+  return (cfl * Math.min(dxM, dyM)) / c;
+}
 
 /** 全球域纬度范围(墨卡托瓦片极限 ±84°) */
 export const GLOBE_LAT_SPAN = 168.0;
@@ -32,7 +32,6 @@ export const GLOBE_LAT_SPAN = 168.0;
 /**
  * 默认时间倍速(相对真实时间的倍数,1 = 真实时间)。
  * 步频 = 倍速 / dt,与显示器帧率无关;科研对照场景选 1× 实时。
- * 64×:dt=3s 平面域约 21 步/秒,dt=50s 全球域约 1.3 步/秒。
  */
 export const DEFAULT_TIME_SCALE = 64;
 

@@ -1,7 +1,6 @@
 import * as THREE from 'three';
-import { GPUComputationRenderer, Variable } from 'three/examples/jsm/misc/GPUComputationRenderer.js';
-import { GRAVITY, SIM_DT } from '../config';
-import { STEP_FRAG } from './shaders';
+import { computeStableDt, GRAVITY } from '../config';
+import { INJECT_FRAG, STEP_FRAG, STEP_FRAG_V2 } from './shaders';
 
 /** 用于将纹理填充为常数的极简着色器 */
 const FILL_FRAG = /* glsl */ `
@@ -30,11 +29,14 @@ void main() {
 }
 `;
 
+/** 数值格式:0 = LF(一阶,教学对照),1 = MUSCL-Rusanov-RK2(二阶) */
+export type GpuScheme = 0 | 1;
 
 /**
  * GPU 海啸求解器。
- * 使用 GPUComputationRenderer 在浮点纹理上以 ping-pong 方式
- * 推进线性浅水方程,状态编码为 RGBA:r=η, g=Hu, b=Hv。
+ * 手动 ping-pong 两个浮点渲染目标推进浅水方程,状态编码 RGBA:r=η, g=Hu, b=Hv。
+ * RK2 格式每步两个 pass(阶段 A 写 other、阶段 B 写回 current),
+ * 震源注入为独立 pass(INJECT_FRAG)。dt 由 CFL 条件自动计算。
  */
 export class TsunamiSolver {
   /** 网格尺寸(x = 经向/宽,y = 纬向/高) */
@@ -45,19 +47,27 @@ export class TsunamiSolver {
   readonly dyM: number;
   /** 全球球面模式(经向周期环绕 + 纬度度量) */
   readonly globeMode: boolean;
-  /** 时间步长(s) */
+  /** 时间步长(s,CFL 自动:0.5·min(dx,dy)/√(g·Hmax)) */
   readonly dtSeconds: number;
 
-  private gpgpu: GPUComputationRenderer;
-  private stateVar: Variable;
   private renderer: THREE.WebGLRenderer;
+  /** ping-pong 状态渲染目标(cur 为当前状态) */
+  private rts: [THREE.WebGLRenderTarget, THREE.WebGLRenderTarget];
+  /** RK2 中间级 U* 暂存目标(不参与 ping-pong) */
+  private rtU0: THREE.WebGLRenderTarget;
+  private cur = 0;
+  private lfMaterial: THREE.ShaderMaterial;
+  private v2Material: THREE.ShaderMaterial;
+  private injectMaterial: THREE.ShaderMaterial;
   private fillMaterial: THREE.ShaderMaterial;
+  private copyMaterial: THREE.ShaderMaterial;
+  private quadScene = new THREE.Scene();
   private fillScene = new THREE.Scene();
   private copyScene = new THREE.Scene();
-  private copyMaterial: THREE.ShaderMaterial;
-  private fillCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private injectScene = new THREE.Scene();
+  private camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
-  /** 求解器 uniform(供外部调整阻尼等) */
+  /** 求解器 uniform(供外部调整阻尼、格式开关等) */
   readonly uniforms: Record<string, THREE.IUniform>;
 
   /** 海床高程纹理(静态) */
@@ -71,7 +81,7 @@ export class TsunamiSolver {
     dxM: number,
     dyM: number,
     globeMode = false,
-    dtSeconds = SIM_DT
+    scheme: GpuScheme = 1
   ) {
     this.renderer = renderer;
     this.sizeX = sizeX;
@@ -79,31 +89,92 @@ export class TsunamiSolver {
     this.dxM = dxM;
     this.dyM = dyM;
     this.globeMode = globeMode;
-    this.dtSeconds = dtSeconds;
 
-    const gpgpu = new GPUComputationRenderer(sizeX, sizeY, renderer);
-    if (!renderer.capabilities.isWebGL2) {
-      gpgpu.setDataType(THREE.HalfFloatType);
+    // CFL 自动时间步长:ν = dt·√(g·Hmax)/min(dx,dy) = CFL_SAFETY
+    let maxDepth = 1;
+    for (let i = 0; i < bathymetry.length; i++) {
+      const d = -bathymetry[i];
+      if (d > maxDepth) maxDepth = d;
     }
-    this.gpgpu = gpgpu;
+    this.dtSeconds = computeStableDt(dxM, dyM, maxDepth);
 
     // --- 海床纹理 ---
-    this.bathyTexture = gpgpu.createTexture();
-    const bData = this.bathyTexture.image.data as unknown as Float32Array;
+    const bathyTex = new THREE.DataTexture(
+      new Float32Array(sizeX * sizeY * 4), sizeX, sizeY,
+      THREE.RGBAFormat, THREE.FloatType
+    );
+    const bData = bathyTex.image.data as unknown as Float32Array;
     for (let i = 0; i < bathymetry.length; i++) {
       bData[i * 4] = bathymetry[i];
       bData[i * 4 + 3] = 1;
     }
-    this.bathyTexture.minFilter = THREE.NearestFilter;
-    this.bathyTexture.magFilter = THREE.NearestFilter;
-    this.bathyTexture.needsUpdate = true;
+    bathyTex.minFilter = THREE.NearestFilter;
+    bathyTex.magFilter = THREE.NearestFilter;
+    bathyTex.needsUpdate = true;
+    this.bathyTexture = bathyTex;
 
-    // --- 状态纹理(初始全零,平静海面) ---
-    const stateTex = gpgpu.createTexture();
-    stateTex.minFilter = THREE.NearestFilter;
-    stateTex.magFilter = THREE.NearestFilter;
+    // --- 状态渲染目标(ping-pong) ---
+    const type = renderer.capabilities.isWebGL2
+      ? THREE.FloatType
+      : THREE.HalfFloatType;
+    const mkRt = (): THREE.WebGLRenderTarget => {
+      const rt = new THREE.WebGLRenderTarget(sizeX, sizeY, {
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter,
+        format: THREE.RGBAFormat,
+        type,
+        depthBuffer: false,
+        stencilBuffer: false,
+      });
+      // 球面模式:经向周期环绕,波可跨越 180° 经线
+      rt.texture.wrapS = globeMode
+        ? THREE.RepeatWrapping
+        : THREE.ClampToEdgeWrapping;
+      rt.texture.wrapT = THREE.ClampToEdgeWrapping;
+      return rt;
+    };
+    this.rts = [mkRt(), mkRt()];
+    this.rtU0 = mkRt();
 
-    // 常数填充用材质(重置海面时复用)
+    // --- 共享 uniforms(步进/注入材质共用同一批对象) ---
+    this.uniforms = {
+      uState: { value: null },
+      u0: { value: null },
+      uBathymetry: { value: bathyTex },
+      uTexel: { value: new THREE.Vector2(1 / sizeX, 1 / sizeY) },
+      uRes: { value: new THREE.Vector2(sizeX, sizeY) },
+      uDx: { value: dxM },
+      uDy: { value: dyM },
+      uDt: { value: this.dtSeconds },
+      uG: { value: GRAVITY },
+      uDamping: { value: 0.9998 },
+      uGlobeMode: { value: globeMode ? 1 : 0 },
+      uScheme: { value: scheme },
+      uStage: { value: 0 },
+      uDiag: { value: 0 },
+      uSource: { value: new THREE.Vector3(0.3, 0.5, 0.05) },
+      uSourceAmp: { value: 0 },
+    };
+    const share = (extra?: Record<string, THREE.IUniform>): Record<string, THREE.IUniform> =>
+      Object.assign({}, this.uniforms, extra ?? {});
+
+    this.lfMaterial = new THREE.ShaderMaterial({
+      uniforms: share(),
+      vertexShader: FILL_VERT,
+      fragmentShader: STEP_FRAG,
+    });
+    this.v2Material = new THREE.ShaderMaterial({
+      uniforms: share(),
+      vertexShader: FILL_VERT,
+      fragmentShader: STEP_FRAG_V2,
+    });
+    this.injectMaterial = new THREE.ShaderMaterial({
+      uniforms: share(),
+      vertexShader: FILL_VERT,
+      fragmentShader: INJECT_FRAG,
+    });
+
+    // 常数填充材质(重置海面)
     this.fillMaterial = new THREE.ShaderMaterial({
       uniforms: { uValue: { value: 0 } },
       vertexShader: FILL_VERT,
@@ -124,84 +195,95 @@ export class TsunamiSolver {
     });
     this.copyScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.copyMaterial));
 
-    // --- 计算变量 ---
-    const v = gpgpu.addVariable('uState', STEP_FRAG, stateTex);
-    v.wrapS = THREE.ClampToEdgeWrapping;
-    v.wrapT = THREE.ClampToEdgeWrapping;
+    const quadLf = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.lfMaterial);
+    quadLf.frustumCulled = false;
+    this.quadScene.add(quadLf);
+    const quadInject = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.injectMaterial);
+    quadInject.frustumCulled = false;
+    this.injectScene.add(quadInject);
 
-    const u = v.material.uniforms;
-    u.uBathymetry = { value: this.bathyTexture };
-    u.uTexel = { value: new THREE.Vector2(1 / sizeX, 1 / sizeY) };
-    u.uDx = { value: dxM };
-    u.uDy = { value: dyM };
-    u.uDt = { value: dtSeconds };
-    u.uG = { value: GRAVITY };
-    u.uDamping = { value: 0.9998 };
-    u.uInject = { value: 0 };
-    u.uSource = { value: new THREE.Vector3(0.3, 0.5, 0.05) };
-    u.uSourceAmp = { value: 0 };
-    u.uGlobeMode = { value: globeMode ? 1 : 0 };
-    this.uniforms = u;
-
-    // 球面模式:经向周期环绕,波可跨越 180° 经线
-    if (globeMode) {
-      v.wrapS = THREE.RepeatWrapping;
-    }
-
-    gpgpu.setVariableDependencies(v, [v]);
-
-    const error = gpgpu.init();
-    if (error) {
-      throw new Error('GPU 计算初始化失败:' + error);
-    }
-    this.stateVar = v;
-    this.fillVariable(v, 0);
+    this.fill(0);
   }
 
-  /** 用常数填充变量的双缓冲纹理(自行管理渲染目标,避免 varying 匹配问题) */
-  private fillVariable(v: Variable, value: number): void {
-    this.fillMaterial.uniforms.uValue.value = value;
-    const prevTarget = this.renderer.getRenderTarget();
-    this.renderer.setRenderTarget(v.renderTargets[0]);
-    this.renderer.render(this.fillScene, this.fillCamera);
-    this.renderer.setRenderTarget(v.renderTargets[1]);
-    this.renderer.render(this.fillScene, this.fillCamera);
-    this.renderer.setRenderTarget(prevTarget);
+  private get curRt(): THREE.WebGLRenderTarget { return this.rts[this.cur]; }
+  private get otherRt(): THREE.WebGLRenderTarget { return this.rts[1 - this.cur]; }
+
+  /** 全屏 pass:scene 渲染到目标 RT(restore 当前渲染目标) */
+  private pass(scene: THREE.Scene, target: THREE.WebGLRenderTarget | null): void {
+    const prev = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(target);
+    this.renderer.render(scene, this.camera);
+    this.renderer.setRenderTarget(prev);
   }
 
-  /** 最新状态纹理(供渲染材质采样) */
+  /** 步进材质切换(uScheme 运行时可改)+ 绑定输入纹理 + quad 显隐 */
+  private bindStepMaterial(): THREE.ShaderMaterial {
+    const v2 = (this.uniforms.uScheme.value as number) > 0.5;
+    const mat = v2 ? this.v2Material : this.lfMaterial;
+    const quad = this.quadScene.children[0] as THREE.Mesh;
+    quad.material = mat;
+    this.uniforms.uState.value = this.curRt.texture;
+    return mat;
+  }
+
+  /** 最新状态纹理(供渲染材质采样;ping-pong 交替,须每帧重绑) */
   get stateTexture(): THREE.Texture {
-    return this.gpgpu.getCurrentRenderTarget(this.stateVar).texture;
+    return this.curRt.texture;
   }
 
   /** 推进 substeps 个子步 */
   step(substeps: number): void {
+    const v2 = (this.uniforms.uScheme.value as number) > 0.5;
     for (let i = 0; i < substeps; i++) {
-      this.gpgpu.compute();
+      if (!v2) {
+        this.bindStepMaterial();
+        this.uniforms.u0.value = null;   // 防残留绑定与目标 RT 形成反馈环
+        this.pass(this.quadScene, this.otherRt);
+        this.cur = 1 - this.cur;
+      } else {
+        // 阶段 A:U* = U + dt·L(U),读 cur(U0)写暂存 rtU0
+        this.bindStepMaterial();
+        this.uniforms.u0.value = null;   // 阶段 A 不用 u0,置空防反馈环
+        this.uniforms.uStage.value = 0;
+        this.pass(this.quadScene, this.rtU0);
+        // 阶段 B:U' = ½U0 + ½(U* + dt·L(U*)),uState=U*(rtU0)、u0=U0(cur),
+        // 写 other 后交换;读写目标互斥,无反馈环
+        this.uniforms.uState.value = this.rtU0.texture;
+        this.uniforms.u0.value = this.curRt.texture;
+        this.uniforms.uStage.value = 1;
+        this.pass(this.quadScene, this.otherRt);
+        this.cur = 1 - this.cur;
+      }
     }
   }
 
   /**
-   * 注入一次海底地震(高斯型海底抬升)。
+   * 注入一次海底地震(高斯型海底抬升,Okada 解的教学级近似)。
+   * 独立 pass:读当前缓冲、写另一缓冲后交换。
    * @param u,v      震中 uv 坐标(0–1)
    * @param ampMeters 初始波幅(m)
    * @param radiusMeters 破裂半径(m)
    */
   inject(u: number, v: number, ampMeters: number, radiusMeters: number): void {
-    this.uniforms.uInject.value = 1;
     (this.uniforms.uSource.value as THREE.Vector3).set(
       u,
       v,
       radiusMeters / (this.dxM * this.sizeX)
     );
     this.uniforms.uSourceAmp.value = ampMeters;
-    this.gpgpu.compute();
-    this.uniforms.uInject.value = 0;
+    this.uniforms.uState.value = this.curRt.texture;
+    this.pass(this.injectScene, this.otherRt);
+    this.cur = 1 - this.cur;
   }
 
   /** 重置为平静海面 */
   reset(): void {
-    this.fillVariable(this.stateVar, 0);
+    this.fill(0);
+  }
+
+  private fill(value: number): void {
+    this.fillMaterial.uniforms.uValue.value = value;
+    for (const rt of this.rts) this.pass(this.fillScene, rt);
   }
 
   /**
@@ -221,7 +303,7 @@ export class TsunamiSolver {
     this.applyEta(eta, nx, ny, true);
   }
 
-  /** 公共实现:把 η 场写入双缓冲(替换或叠加) */
+  /** 公共实现:把 η 场写入状态(替换或叠加) */
   private applyEta(eta: Float32Array, nx: number, ny: number, additive: boolean): void {
     const rgba = new Float32Array(nx * ny * 4);
     for (let i = 0; i < eta.length; i++) {
@@ -237,36 +319,27 @@ export class TsunamiSolver {
 
     this.copyMaterial.uniforms.uSrc.value = tex;
     this.copyMaterial.uniforms.uAdd.value = additive ? 1 : 0;
-    const prevTarget = this.renderer.getRenderTarget();
     if (!additive) {
-      for (const rt of this.stateVar.renderTargets) {
-        this.renderer.setRenderTarget(rt);
-        this.renderer.render(this.copyScene, this.fillCamera);
-      }
+      this.copyMaterial.uniforms.uState.value = null;
+      this.pass(this.copyScene, this.curRt);
+      this.pass(this.copyScene, this.otherRt);
     } else {
-      // 叠加模式:避免自读自写,先写非当前缓冲,再反向回写
-      const rts = this.stateVar.renderTargets;
-      const cur = this.gpgpu.getCurrentRenderTarget(this.stateVar);
-      const curIdx = rts[0] === cur ? 0 : 1;
-      const otherIdx = 1 - curIdx;
-      this.copyMaterial.uniforms.uState.value = cur.texture;
-      this.renderer.setRenderTarget(rts[otherIdx]);
-      this.renderer.render(this.copyScene, this.fillCamera);
-      this.copyMaterial.uniforms.uState.value = rts[otherIdx].texture;
-      this.renderer.setRenderTarget(rts[curIdx]);
-      this.renderer.render(this.copyScene, this.fillCamera);
+      // 叠加模式:避免自读自写,先写另一缓冲再交换
+      this.copyMaterial.uniforms.uState.value = this.curRt.texture;
+      this.pass(this.copyScene, this.otherRt);
+      this.cur = 1 - this.cur;
     }
-    this.renderer.setRenderTarget(prevTarget);
     tex.dispose();
   }
 
   /** 回读全场,返回峰值 |η|(m)。仅在低频统计时调用。
    * @param out 可选复用缓冲区(尺寸需匹配),避免每秒重分配 */
   readPeak(out?: Float32Array): number {
-    const rt = this.gpgpu.getCurrentRenderTarget(this.stateVar);
     const need = this.sizeX * this.sizeY * 4;
     const buf = out && out.length === need ? out : new Float32Array(need);
-    this.renderer.readRenderTargetPixels(rt, 0, 0, this.sizeX, this.sizeY, buf);
+    this.renderer.readRenderTargetPixels(
+      this.curRt, 0, 0, this.sizeX, this.sizeY, buf
+    );
     let peak = 0;
     for (let i = 0; i < buf.length; i += 4) {
       const a = Math.abs(buf[i]);
@@ -276,7 +349,13 @@ export class TsunamiSolver {
   }
 
   dispose(): void {
-    this.gpgpu.dispose();
+    for (const rt of this.rts) rt.dispose();
+    this.rtU0.dispose();
     this.bathyTexture.dispose();
+    this.lfMaterial.dispose();
+    this.v2Material.dispose();
+    this.injectMaterial.dispose();
+    this.fillMaterial.dispose();
+    this.copyMaterial.dispose();
   }
 }
