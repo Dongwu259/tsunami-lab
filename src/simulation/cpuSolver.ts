@@ -4,7 +4,7 @@
  * 供 CI 基准测试(衰减、收敛阶、守恒、长时稳定)。
  * 网格行主序(自南向北);状态:eta(m)、hu/hv(深度积分通量 m²/s)。
  */
-import { GRAVITY } from '../config';
+import { GRAVITY, H_MIN, MANNING_N } from '../config';
 
 export type Scheme = 'lf' | 'v2';
 
@@ -24,6 +24,10 @@ export interface CpuSolverOptions {
   spongeWidth?: number;
   /** x 方向周期边界(plane 网格下仅供收敛基准使用) */
   periodicX?: boolean;
+  /** 曼宁摩擦系数 n(仅 v2;0 关闭,默认 MANNING_N) */
+  manning?: number;
+  /** 干单元阈值(m):总水深 h=H+η < hMin 视干(默认 H_MIN) */
+  hMin?: number;
 }
 
 function minmod(a: number, b: number): number {
@@ -46,6 +50,10 @@ export class CpuSolver {
   private readonly periodicX: boolean;
   scheme: Scheme;
   damping: number;
+  /** 曼宁摩擦系数 n(仅 v2;lf 仍用 damping) */
+  manning: number;
+  /** 干单元阈值(m) */
+  hMin: number;
   eta: Float64Array;
   hu: Float64Array;
   hv: Float64Array;
@@ -75,6 +83,8 @@ export class CpuSolver {
     this.periodicX = o.periodicX ?? false;
     this.scheme = o.scheme ?? 'v2';
     this.damping = o.damping ?? 0.9998;
+    this.manning = o.manning ?? MANNING_N;
+    this.hMin = o.hMin ?? H_MIN;
     const n = o.nx * o.ny;
     this.H = new Float64Array(n);
     this.dxEff = new Float64Array(n);
@@ -214,17 +224,22 @@ export class CpuSolver {
       sL[q] = minmod(f[b] - f[a], f[c] - f[b]);
       sR[q] = minmod(f[c] - f[b], f[d] - f[c]);
     }
-    const HL = H[b];
-    const HR = H[c];
-    const s = Math.sqrt(GRAVITY * Math.max(HL, HR));
     const eL = this.eta[b] + 0.5 * sL[0];
     const eR = this.eta[c] - 0.5 * sR[0];
     const uL = this.hu[b] + 0.5 * sL[1];
     const uR = this.hu[c] - 0.5 * sR[1];
     const vL = this.hv[b] + 0.5 * sL[2];
     const vR = this.hv[c] - 0.5 * sR[2];
+    // 非线性总水深 h=H+η;干床(h<hMin)界面通量置零(与 GPU musclFluxX 同构)
+    const hL = H[b] + eL;
+    const hR = H[c] + eR;
+    if (hL < this.hMin || hR < this.hMin) {
+      this.fx[0] = 0; this.fx[1] = 0; this.fx[2] = 0;
+      return;
+    }
+    const s = Math.sqrt(GRAVITY * Math.max(hL, hR));
     this.fx[0] = 0.5 * (uL + uR) - 0.5 * s * (eR - eL);
-    this.fx[1] = 0.5 * GRAVITY * (HL * eL + HR * eR) - 0.5 * s * (uR - uL);
+    this.fx[1] = 0.5 * GRAVITY * (hL * eL + hR * eR) - 0.5 * s * (uR - uL);
     this.fx[2] = -0.5 * s * (vR - vL);
   }
 
@@ -243,18 +258,23 @@ export class CpuSolver {
       sL[q] = minmod(f[b] - f[a], f[c] - f[b]);
       sR[q] = minmod(f[c] - f[b], f[d] - f[c]);
     }
-    const HL = H[b];
-    const HR = H[c];
-    const s = Math.sqrt(GRAVITY * Math.max(HL, HR));
     const eL = this.eta[b] + 0.5 * sL[0];
     const eR = this.eta[c] - 0.5 * sR[0];
     const uL = this.hu[b] + 0.5 * sL[1];
     const uR = this.hu[c] - 0.5 * sR[1];
     const vL = this.hv[b] + 0.5 * sL[2];
     const vR = this.hv[c] - 0.5 * sR[2];
+    // 非线性总水深 h=H+η;干床(h<hMin)界面通量置零(与 GPU musclFluxY 同构)
+    const hL = H[b] + eL;
+    const hR = H[c] + eR;
+    if (hL < this.hMin || hR < this.hMin) {
+      this.fy[0] = 0; this.fy[1] = 0; this.fy[2] = 0;
+      return;
+    }
+    const s = Math.sqrt(GRAVITY * Math.max(hL, hR));
     this.fy[0] = 0.5 * (vL + vR) - 0.5 * s * (eR - eL);
     this.fy[1] = -0.5 * s * (uR - uL);
-    this.fy[2] = 0.5 * GRAVITY * (HL * eL + HR * eR) - 0.5 * s * (vR - vL);
+    this.fy[2] = 0.5 * GRAVITY * (hL * eL + hR * eR) - 0.5 * s * (vR - vL);
   }
 
   /** 空间算子 L(U) = -div F → lEta/lHu/lHv */
@@ -262,7 +282,7 @@ export class CpuSolver {
     // 通量函数读取 this.eta/hu/hv,故先别名交换
     const saveE = this.eta, saveU = this.hu, saveV = this.hv;
     this.eta = e; this.hu = u; this.hv = v;
-    const { nx, ny, dy, lEta, lHu, lHv } = this;
+    const { nx, ny, dy, lEta, lHu, lHv, H } = this;
     for (let j = 0; j < ny; j++) {
       for (let i = 0; i < nx; i++) {
         const k = j * nx + i;
@@ -275,16 +295,24 @@ export class CpuSolver {
         this.fluxY(i, j);
         const yp = this.fy;
         const dxe = this.dxEff[k];
+        // 井平衡源项:g·η·∂h/∂x(h=H+η),抵消 g·h·η 通量多出的 -g·η·∂h/∂x,
+        // 使动量方程精确回到 -g·h·∂η/∂x(正确 Green 定律浅水放大);η=0 时源项为 0,严格静水平衡
+        const im1 = j * nx + this.ix(i - 1);
+        const ip1 = j * nx + this.ix(i + 1);
+        const jm1 = this.iy(j - 1) * nx + i;
+        const jp1 = this.iy(j + 1) * nx + i;
+        const dhdx = ((H[ip1] + e[ip1]) - (H[im1] + e[im1])) / (2 * dxe);
+        const dhdy = ((H[jp1] + e[jp1]) - (H[jm1] + e[jm1])) / (2 * dy);
         lEta[k] = -((xp[0] - xm[0]) / dxe + (yp[0] - ym[0]) / dy);
-        lHu[k] = -((xp[1] - xm[1]) / dxe + (yp[1] - ym[1]) / dy);
-        lHv[k] = -((xp[2] - xm[2]) / dxe + (yp[2] - ym[2]) / dy);
+        lHu[k] = -((xp[1] - xm[1]) / dxe + (yp[1] - ym[1]) / dy) + GRAVITY * e[k] * dhdx;
+        lHv[k] = -((xp[2] - xm[2]) / dxe + (yp[2] - ym[2]) / dy) + GRAVITY * e[k] * dhdy;
       }
     }
     this.eta = saveE; this.hu = saveU; this.hv = saveV;
   }
 
   private stepV2(): void {
-    const { dt, eta, hu, hv, tEta, tHu, tHv, lEta, lHu, lHv } = this;
+    const { dt, eta, hu, hv, tEta, tHu, tHv, lEta, lHu, lHv, H, hMin, manning } = this;
     // 阶段 A:U* = U + dt·L(U)
     this.computeL(eta, hu, hv);
     for (let k = 0; k < eta.length; k++) {
@@ -292,16 +320,33 @@ export class CpuSolver {
       tHu[k] = hu[k] + dt * lHu[k];
       tHv[k] = hv[k] + dt * lHv[k];
     }
-    // 阶段 B:U' = ½U + ½(U* + dt·L(U*))
+    // 阶段 B:U' = ½U + ½(U* + dt·L(U*)),再叠加算子分裂的修改项
     this.computeL(tEta, tHu, tHv);
     for (let k = 0; k < eta.length; k++) {
+      // 陆地(静水深 H < hMin)为干单元:η 冻结、动量清零(不参与通量 → 质量守恒)
+      if (H[k] < hMin) {
+        hu[k] = 0;
+        hv[k] = 0;
+        continue;
+      }
       const eC = 0.5 * (eta[k] + tEta[k] + dt * lEta[k]);
-      const uC = 0.5 * (hu[k] + tHu[k] + dt * lHu[k]);
-      const vC = 0.5 * (hv[k] + tHv[k] + dt * lHv[k]);
-      const m = this.damping * this.sponge[k] * this.wet[k];
-      eta[k] = this.wet[k] > 0.5 ? eC : eta[k];
-      hu[k] = uC * m;
-      hv[k] = vC * m;
+      let uC = 0.5 * (hu[k] + tHu[k] + dt * lHu[k]);
+      let vC = 0.5 * (hv[k] + tHv[k] + dt * lHv[k]);
+      // 边界海绵(仅动量)
+      const sp = this.sponge[k];
+      uC *= sp;
+      vC *= sp;
+      // 隐式曼宁摩擦:hu /= 1 + dt·g·n²·|u|/h^(4/3),|u| = √(u²+v²)/h
+      if (manning > 0) {
+        const h = Math.max(H[k] + eC, hMin);
+        const speed = Math.sqrt(uC * uC + vC * vC) / h;
+        const cf = (dt * GRAVITY * manning * manning * speed) / Math.pow(h, 4 / 3);
+        uC /= 1 + cf;
+        vC /= 1 + cf;
+      }
+      eta[k] = eC;
+      hu[k] = uC;
+      hv[k] = vC;
     }
   }
 }

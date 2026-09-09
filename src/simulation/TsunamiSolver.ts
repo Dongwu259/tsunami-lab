@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { computeStableDt, GRAVITY } from '../config';
+import { computeStableDt, GRAVITY, H_MIN, MANNING_N } from '../config';
 import { INJECT_FRAG, STEP_FRAG, STEP_FRAG_V2 } from './shaders';
 
 /** 用于将纹理填充为常数的极简着色器 */
@@ -147,7 +147,9 @@ export class TsunamiSolver {
       uDy: { value: dyM },
       uDt: { value: this.dtSeconds },
       uG: { value: GRAVITY },
-      uDamping: { value: 0.9998 },
+      uDamping: { value: 0.9998 },   // 仅 LF(legacy)格式使用
+      uManning: { value: MANNING_N }, // V2 隐式曼宁摩擦系数 n
+      uHMin: { value: H_MIN },        // 干单元阈值(m)
       uGlobeMode: { value: globeMode ? 1 : 0 },
       uScheme: { value: scheme },
       uStage: { value: 0 },

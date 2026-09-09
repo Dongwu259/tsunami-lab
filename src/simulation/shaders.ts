@@ -84,8 +84,9 @@ void main() {
 `;
 
 /** MUSCL 界面通量公共代码段(与 cpuSolver.ts fluxX/fluxY 同构)。
- * minmod 限制器 + Rusanov(局部 Lax–Friedrichs)通量,波速 s = √(g·max(HL,HR))。
- * 线性浅水通量:Fx = (hu, g·H·η, 0),Fy = (hv, 0, g·H·η)。 */
+ * minmod 限制器 + Rusanov(局部 Lax–Friedrichs)通量,非线性总水深 h=H+η,
+ * 波速 s = √(g·max(hL,hR));干床(h<uHMin)界面通量置零。
+ * 非线性浅水通量:Fx = (hu, g·h·η, 0),Fy = (hv, 0, g·h·η)。 */
 const FLUX_GLSL = /* glsl */ `
 uniform sampler2D uState;
 uniform sampler2D uBathymetry;
@@ -96,6 +97,7 @@ uniform float uDy;
 uniform float uDt;
 uniform float uG;
 uniform float uGlobeMode;
+uniform float uHMin;
 
 float minmod(float a, float b) {
   // 同号取绝对值较小者,异号(或含零)返回 0(与 cpuSolver.minmod 同构)
@@ -124,13 +126,16 @@ vec3 musclFluxX(ivec2 q) {
   float HC = cellDepth(cellIdx(q.x + 1, q.y));
   vec3 sL = vec3(minmod(B.r - A.r, C.r - B.r), minmod(B.g - A.g, C.g - B.g), minmod(B.b - A.b, C.b - B.b));
   vec3 sR = vec3(minmod(C.r - B.r, D.r - C.r), minmod(C.g - B.g, D.g - C.g), minmod(C.b - B.b, D.b - C.b));
-  float s = sqrt(uG * max(HB, HC));
   float eL = B.r + 0.5 * sL.x, eR = C.r - 0.5 * sR.x;
   float uL = B.g + 0.5 * sL.y, uR = C.g - 0.5 * sR.y;
   float vL = B.b + 0.5 * sL.z, vR = C.b - 0.5 * sR.z;
+  // 非线性总水深 h=H+η;干床(h<uHMin)界面通量置零(与 cpuSolver.fluxX 同构)
+  float hL = HB + eL, hR = HC + eR;
+  if (hL < uHMin || hR < uHMin) return vec3(0.0);
+  float s = sqrt(uG * max(hL, hR));
   return vec3(
     0.5 * (uL + uR) - 0.5 * s * (eR - eL),
-    0.5 * uG * (HB * eL + HC * eR) - 0.5 * s * (uR - uL),
+    0.5 * uG * (hL * eL + hR * eR) - 0.5 * s * (uR - uL),
     -0.5 * s * (vR - vL));
 }
 
@@ -144,26 +149,29 @@ vec3 musclFluxY(ivec2 q) {
   float HC = cellDepth(cellIdx(q.x, q.y + 1));
   vec3 sL = vec3(minmod(B.r - A.r, C.r - B.r), minmod(B.g - A.g, C.g - B.g), minmod(B.b - A.b, C.b - B.b));
   vec3 sR = vec3(minmod(C.r - B.r, D.r - C.r), minmod(C.g - B.g, D.g - C.g), minmod(C.b - B.b, D.b - C.b));
-  float s = sqrt(uG * max(HB, HC));
   float eL = B.r + 0.5 * sL.x, eR = C.r - 0.5 * sR.x;
   float uL = B.g + 0.5 * sL.y, uR = C.g - 0.5 * sR.y;
   float vL = B.b + 0.5 * sL.z, vR = C.b - 0.5 * sR.z;
+  // 非线性总水深 h=H+η;干床(h<uHMin)界面通量置零(与 cpuSolver.fluxY 同构)
+  float hL = HB + eL, hR = HC + eR;
+  if (hL < uHMin || hR < uHMin) return vec3(0.0);
+  float s = sqrt(uG * max(hL, hR));
   return vec3(
     0.5 * (vL + vR) - 0.5 * s * (eR - eL),
     -0.5 * s * (uR - uL),
-    0.5 * uG * (HB * eL + HC * eR) - 0.5 * s * (vR - vL));
+    0.5 * uG * (hL * eL + hR * eR) - 0.5 * s * (vR - vL));
 }
 `;
 
 /** RK2 推进着色器(uScheme=1)。uStage 切换两个 SSP-RK2 阶段:
  *   0: U* = U + dt·L(U)              (uState = U0)
  *   1: U' = ½U0 + ½(U* + dt·L(U*))   (uState = U*,u0 = U0)
- * 修改项(阻尼·海绵·干单元)按算子分裂在阶段 1 合并后一次性应用,
- * 与 cpuSolver.stepV2 同构。 */
+ * 非线性总水深 h=H+η + 井平衡源项;修改项(海绵·曼宁摩擦·干单元)按算子分裂
+ * 在阶段 1 合并后一次性应用,与 cpuSolver.stepV2 同构。 */
 export const STEP_FRAG_V2 = /* glsl */ `
 ${FLUX_GLSL}
 uniform float uStage;
-uniform float uDamping;
+uniform float uManning;   // 曼宁摩擦系数 n(0 关闭)
 uniform float uDiag;      // DEV 诊断:1 = 直接输出 L 算子(不推进)
 uniform sampler2D u0;   // 阶段 B 的 RK2 基态 U0
 
@@ -173,7 +181,7 @@ void main() {
 
   float bed = texture2D(uBathymetry, uv).r;
   float H = max(-bed, 0.0);
-  float wet = step(1.0, H);
+  float wet = step(uHMin, H);   // 1 = 水域(静水深 ≥ hMin),0 = 永久陆地
 
   // 球面度量:经向格距随纬度收缩 + 极地 CFL 下限保护(与 LF/CPU 镜像同构)
   float lat = (uv.y - 0.5) * 168.0;
@@ -193,6 +201,16 @@ void main() {
     (fxp.y - fxm.y) / dxEff + (fyp.y - fym.y) / uDy,
     (fxp.z - fxm.z) / dxEff + (fyp.z - fym.z) / uDy);
 
+  // 井平衡源项 g·η·∂h/∂x(h=H+η):抵消 g·h·η 通量多出的地形项,使动量方程
+  // 精确回到 -g·h·∂η/∂x;η=0 时源项为 0 → 严格静水平衡(与 cpuSolver.computeL 同构)
+  float etaC = texture2D(uState, uv).r;
+  float hIp = cellDepth(cellIdx(p.x + 1, p.y)) + cellState(cellIdx(p.x + 1, p.y)).r;
+  float hIm = cellDepth(cellIdx(p.x - 1, p.y)) + cellState(cellIdx(p.x - 1, p.y)).r;
+  float hJp = cellDepth(cellIdx(p.x, p.y + 1)) + cellState(cellIdx(p.x, p.y + 1)).r;
+  float hJm = cellDepth(cellIdx(p.x, p.y - 1)) + cellState(cellIdx(p.x, p.y - 1)).r;
+  L.y += uG * etaC * (hIp - hIm) / (2.0 * dxEff);
+  L.z += uG * etaC * (hJp - hJm) / (2.0 * uDy);
+
   if (uDiag > 0.5) {
     // 诊断:r=Lη·1e3, g=Lhu, b=Lhv, a=fxp.y-fxm.y(压力通量差)
     gl_FragColor = vec4(L.x * 1000.0, L.y, L.z, fxp.y - fxm.y);
@@ -208,15 +226,23 @@ void main() {
     vec4 U0 = texture2D(u0, uv);
     vec4 Us = texture2D(uState, uv);
     outState = vec4(0.5 * U0.rgb + 0.5 * (Us.rgb + uDt * L), 1.0);
-    // 边界海绵:平面域四边吸收;球面仅两极吸收
+    // 边界海绵(仅动量):平面域四边吸收;球面仅两极吸收
     float edge = uGlobeMode > 0.5
         ? min(uv.y, 1.0 - uv.y)
         : min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
     float spongeWidth = uGlobeMode > 0.5 ? 0.03 : 0.06;
     float sponge = smoothstep(0.0, spongeWidth, edge);
-    float m = uDamping * sponge * wet;
-    outState.g *= m;
-    outState.b *= m;
+    outState.g *= sponge;
+    outState.b *= sponge;
+    // 隐式曼宁摩擦:hu /= 1 + dt·g·n²·|u|/h^(4/3),|u| = √(u²+v²)/h
+    float h = max(H + outState.r, uHMin);
+    float speed = length(outState.gb) / h;
+    float cf = uDt * uG * uManning * uManning * speed / pow(h, 4.0 / 3.0);
+    outState.g /= 1.0 + cf;
+    outState.b /= 1.0 + cf;
+    // 永久陆地(H < hMin):动量清零、η 冻结(干界面通量已置零 → 质量守恒)
+    outState.g *= wet;
+    outState.b *= wet;
     outState.r = mix(U0.r, outState.r, wet);
   }
   gl_FragColor = outState;

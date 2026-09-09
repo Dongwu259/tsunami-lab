@@ -30,6 +30,15 @@ export function computeStableDt(
 export const GLOBE_LAT_SPAN = 168.0;
 
 /**
+ * 曼宁摩擦系数 n(s/m^(1/3))。海面/海底粗糙度的教学级默认值:
+ * 开阔深水取 0.025;近岸浅滩可增大。UI 滑杆范围 0–0.05。
+ */
+export const MANNING_N = 0.025;
+
+/** 干单元判定阈值(m):总水深 h = H+η < H_MIN 视为干,通量置零、η 冻结 */
+export const H_MIN = 1e-3;
+
+/**
  * 默认时间倍速(相对真实时间的倍数,1 = 真实时间)。
  * 步频 = 倍速 / dt,与显示器帧率无关;科研对照场景选 1× 实时。
  */

@@ -1,5 +1,5 @@
 import GUI from 'lil-gui';
-import { DEFAULT_TIME_SCALE } from '../config';
+import { DEFAULT_TIME_SCALE, MANNING_N } from '../config';
 import { catalogOptions, EARTHQUAKE_CATALOG } from '../data/earthquakes';
 
 export interface SimParams {
@@ -8,6 +8,8 @@ export interface SimParams {
   timeScale: number;
   /** 数值格式:'v2' = MUSCL-RK2(二阶),'lf' = Lax–Friedrichs(一阶对照) */
   scheme: string;
+  /** 曼宁摩擦系数 n(仅 v2;0 关闭,范围 0–0.05) */
+  manning: number;
   exaggeration: number;
   colorRange: number;
   waterOpacity: number;
@@ -33,6 +35,7 @@ export interface SimParams {
 export interface PanelCallbacks {
   onReset(): void;
   onSchemeChange(scheme: string): void;
+  onManningChange(manning: number): void;
   onRandomQuake(): void;
   onTohokuQuake(): void;
   onExaggerationChange(ex: number): void;
@@ -73,6 +76,7 @@ export function createPanel(cb: PanelCallbacks): PanelHandle {
     playing: true,
     timeScale: DEFAULT_TIME_SCALE,
     scheme: 'v2',
+    manning: MANNING_N,
     exaggeration: 3,
     colorRange: 2,
     waterOpacity: 0.8,
@@ -111,6 +115,10 @@ export function createPanel(cb: PanelCallbacks): PanelHandle {
     })
     .name('数值格式')
     .onChange((v: string) => cb.onSchemeChange(v));
+  sim
+    .add(params, 'manning', 0, 0.05, 0.001)
+    .name('曼宁摩擦 n(仅二阶)')
+    .onChange((v: number) => cb.onManningChange(v));
   sim.add({ reset: cb.onReset }, 'reset').name('重置海面');
 
   // --- 地震源 ---
