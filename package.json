@@ -1,6 +1,6 @@
 {
   "name": "tsunami-lab",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "教学级可视化海啸模拟实验室(WebGL2 浅水方程)",
   "type": "module",
   "private": true,

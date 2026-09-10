@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { computeStableDt, GRAVITY, H_MIN, MANNING_N } from '../config';
+import { computeStableDt, GRAVITY, H_MIN, MANNING_N, GLOBE_LAT_SPAN, reducedGridMinFactor } from '../config';
 import { INJECT_FRAG, STEP_FRAG, STEP_FRAG_V2 } from './shaders';
 
 /** 用于将纹理填充为常数的极简着色器 */
@@ -47,7 +47,7 @@ export class TsunamiSolver {
   readonly dyM: number;
   /** 全球球面模式(经向周期环绕 + 纬度度量) */
   readonly globeMode: boolean;
-  /** 时间步长(s,CFL 自动:0.5·min(dx,dy)/√(g·Hmax)) */
+  /** 时间步长(s,CFL 自动:0.5·min(dxEff,dy)/√(g·Hmax);globe 用缩减纬网最小经向格距) */
   readonly dtSeconds: number;
 
   private renderer: THREE.WebGLRenderer;
@@ -90,13 +90,16 @@ export class TsunamiSolver {
     this.dyM = dyM;
     this.globeMode = globeMode;
 
-    // CFL 自动时间步长:ν = dt·√(g·Hmax)/min(dx,dy) = CFL_SAFETY
+    // CFL 自动时间步长:ν = dt·√(g·Hmax)/min(dxEff,dy) = CFL_SAFETY
     let maxDepth = 1;
     for (let i = 0; i < bathymetry.length; i++) {
       const d = -bathymetry[i];
       if (d > maxDepth) maxDepth = d;
     }
-    this.dtSeconds = computeStableDt(dxM, dyM, maxDepth);
+    // 缩减纬网:globe 经向有效格距按 min(k·cosφ) 缩减(与着色器/CPU dxEff 同构),
+    // dt 取缩减后最小格距 → 去除旧 cflFloor 后极地仍稳定且波速正确
+    const dxEffMin = globeMode ? dxM * reducedGridMinFactor(GLOBE_LAT_SPAN, sizeY) : dxM;
+    this.dtSeconds = computeStableDt(dxEffMin, dyM, maxDepth);
 
     // --- 海床纹理 ---
     const bathyTex = new THREE.DataTexture(

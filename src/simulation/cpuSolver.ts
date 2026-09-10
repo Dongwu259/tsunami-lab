@@ -4,7 +4,7 @@
  * 供 CI 基准测试(衰减、收敛阶、守恒、长时稳定)。
  * 网格行主序(自南向北);状态:eta(m)、hu/hv(深度积分通量 m²/s)。
  */
-import { GRAVITY, H_MIN, MANNING_N } from '../config';
+import { GRAVITY, H_MIN, MANNING_N, polarStride } from '../config';
 
 export type Scheme = 'lf' | 'v2';
 
@@ -28,6 +28,8 @@ export interface CpuSolverOptions {
   manning?: number;
   /** 干单元阈值(m):总水深 h=H+η < hMin 视干(默认 H_MIN) */
   hMin?: number;
+  /** 辐射边界(单向波 η 外推,plane 默认开;globe/periodicX 该向自动关闭) */
+  radiation?: boolean;
 }
 
 function minmod(a: number, b: number): number {
@@ -38,6 +40,13 @@ function minmod(a: number, b: number): number {
 function smoothstepEdge(edge: number, width: number): number {
   const t = Math.min(Math.max(edge / width, 0), 1);
   return t * t * (3 - 2 * t);
+}
+
+/** 2 单元薄海绵兜底因子:辐射边界单元(d=0)不阻尼(交由辐射 BC 精确透射),
+ * 内侧 d=1,2 温和动量阻尼(带 floor 避免刚性壁反射),吸收斜入射等残余。 */
+function thinSpongeFactor(d: number): number {
+  if (d <= 0 || d >= 3) return 1;
+  return 1 - 0.08 * (3 - d) / 2;
 }
 
 export class CpuSolver {
@@ -59,10 +68,16 @@ export class CpuSolver {
   hv: Float64Array;
 
   private readonly H: Float64Array;
-  /** 逐单元经向有效格距(球面极地保护,与着色器 cflFloor 同构) */
+  /** 逐单元经向有效格距(缩减纬网 dxEff=k·dx·cosφ,与着色器同构) */
   private readonly dxEff: Float64Array;
+  /** 逐纬向行缩减纬网 stride k(|φ|>74°→2,>80°→4;plane 全 1) */
+  private readonly kLat: Int32Array;
   private readonly sponge: Float64Array;
   private readonly wet: Float64Array;
+  /** 辐射边界:开关与逐单元内向邻居索引(-1 表示非辐射边界单元) */
+  private readonly radiation: boolean;
+  private readonly radXnb: Int32Array;
+  private readonly radYnb: Int32Array;
   private tEta: Float64Array;
   private tHu: Float64Array;
   private tHv: Float64Array;
@@ -85,11 +100,15 @@ export class CpuSolver {
     this.damping = o.damping ?? 0.9998;
     this.manning = o.manning ?? MANNING_N;
     this.hMin = o.hMin ?? H_MIN;
+    this.radiation = o.radiation ?? !(o.globe ?? false);
     const n = o.nx * o.ny;
     this.H = new Float64Array(n);
     this.dxEff = new Float64Array(n);
+    this.kLat = new Int32Array(o.ny).fill(1);
     this.sponge = new Float64Array(n);
     this.wet = new Float64Array(n);
+    this.radXnb = new Int32Array(n).fill(-1);
+    this.radYnb = new Int32Array(n).fill(-1);
     this.eta = new Float64Array(n);
     this.hu = new Float64Array(n);
     this.hv = new Float64Array(n);
@@ -101,21 +120,41 @@ export class CpuSolver {
     this.lHv = new Float64Array(n);
     const cosDeg = Math.PI / 180;
     const width = o.spongeWidth ?? (this.globe ? 0.03 : 0.06);
+    // 辐射边界开启且未显式指定海绵宽度时,改用 2 单元薄海绵兜底(逐方向,守卫小网格)。
+    // 仅限 v2:辐射 BC 是二阶格式特性;lf 保留旧宽海绵作教学基线(与 GPU 两着色器分工一致)
+    const thinSponge = this.radiation && this.scheme === 'v2' && o.spongeWidth === undefined;
+    const radX = !this.globe && !this.periodicX && o.nx > 2;
+    const radY = !this.globe && o.ny > 2;
     for (let j = 0; j < o.ny; j++) {
       const v = (j + 0.5) / o.ny;
       const lat = (v - 0.5) * 168.0;
       const cosLat = Math.cos(Math.max(Math.abs(lat), 5.0) * cosDeg);
+      // 缩减纬网:高纬经向每 k 列合并(stride-k 采样),dxEff=k·dx·cosφ 保持有限;
+      // 去除旧 cflFloor hack → 极地波速恢复正确(74° 误差 <3%),dt 不再被极地拖垮
+      const kj = this.globe ? polarStride(lat) : 1;
+      this.kLat[j] = kj;
       for (let i = 0; i < o.nx; i++) {
         const k = j * o.nx + i;
         this.H[k] = Math.max(-o.bed[k], 0);
-        const floor = this.dt * Math.sqrt(GRAVITY * this.H[k]) * 2.2 + 100.0;
-        this.dxEff[k] = this.globe ? Math.max(o.dx * cosLat, floor) : o.dx;
-        const u = (i + 0.5) / o.nx;
-        const edge = this.globe
-          ? Math.min(v, 1 - v)
-          : Math.min(Math.min(u, 1 - u), Math.min(v, 1 - v));
-        this.sponge[k] = width > 0 ? smoothstepEdge(edge, width) : 1;
+        this.dxEff[k] = this.globe ? kj * o.dx * cosLat : o.dx;
+        if (thinSponge) {
+          let sp = 1;
+          if (radX) sp *= thinSpongeFactor(Math.min(i, o.nx - 1 - i));
+          if (radY) sp *= thinSpongeFactor(Math.min(j, o.ny - 1 - j));
+          this.sponge[k] = sp;
+        } else {
+          const u = (i + 0.5) / o.nx;
+          const edge = this.globe
+            ? Math.min(v, 1 - v)
+            : Math.min(Math.min(u, 1 - u), Math.min(v, 1 - v));
+          this.sponge[k] = width > 0 ? smoothstepEdge(edge, width) : 1;
+        }
         this.wet[k] = this.H[k] > 1.0 ? 1.0 : 0.0;
+        // 辐射边界预计算:边界单元记录内向邻居索引(方向决定出射特征;陆地 H=0 在步进中跳过)
+        if (radX && i === 0) this.radXnb[k] = k + 1;
+        else if (radX && i === o.nx - 1) this.radXnb[k] = k - 1;
+        if (radY && j === 0) this.radYnb[k] = k + o.nx;
+        else if (radY && j === o.ny - 1) this.radYnb[k] = k - o.nx;
       }
     }
   }
@@ -175,10 +214,11 @@ export class CpuSolver {
     for (let j = 0; j < ny; j++) {
       const rm = this.iy(j - 1) * nx;
       const rp = this.iy(j + 1) * nx;
+      const s = this.kLat[j];   // 缩减纬网 stride(经向邻居 i±s)
       for (let i = 0; i < nx; i++) {
         const k = j * nx + i;
-        const l = j * nx + this.ix(i - 1);
-        const r = j * nx + this.ix(i + 1);
+        const l = j * nx + this.ix(i - s);
+        const r = j * nx + this.ix(i + s);
         const d = rm + i;
         const u = rp + i;
         const dxe = this.dxEff[k];
@@ -208,14 +248,15 @@ export class CpuSolver {
 
   // ---------------------------------------------------------------- V2(MUSCL-HLL-RK2)
 
-  /** x 方向界面 i+1/2 通量 → this.fx(MUSCL 重构 + Rusanov) */
-  private fluxX(i: number, j: number): void {
+  /** x 方向界面通量 → this.fx(MUSCL 重构 + Rusanov)。
+   * st=缩减纬网 stride:界面位于 cell i 与 i+st 之间,重构取 i-st/i/i+st/i+2st。 */
+  private fluxX(i: number, j: number, st: number): void {
     const { nx, H } = this;
     const row = j * nx;
-    const a = row + this.ix(i - 1);
+    const a = row + this.ix(i - st);
     const b = row + this.ix(i);
-    const c = row + this.ix(i + 1);
-    const d = row + this.ix(i + 2);
+    const c = row + this.ix(i + st);
+    const d = row + this.ix(i + 2 * st);
     const e = [this.eta, this.hu, this.hv];
     const sL = [0, 0, 0];
     const sR = [0, 0, 0];
@@ -284,11 +325,12 @@ export class CpuSolver {
     this.eta = e; this.hu = u; this.hv = v;
     const { nx, ny, dy, lEta, lHu, lHv, H } = this;
     for (let j = 0; j < ny; j++) {
+      const s = this.kLat[j];   // 缩减纬网 stride(经向界面/源项均用 i±s)
       for (let i = 0; i < nx; i++) {
         const k = j * nx + i;
-        this.fluxX(i - 1, j);
+        this.fluxX(i - s, j, s);
         const xm = [this.fx[0], this.fx[1], this.fx[2]];
-        this.fluxX(i, j);
+        this.fluxX(i, j, s);
         const xp = this.fx;
         this.fluxY(i, j - 1);
         const ym = [this.fy[0], this.fy[1], this.fy[2]];
@@ -297,8 +339,8 @@ export class CpuSolver {
         const dxe = this.dxEff[k];
         // 井平衡源项:g·η·∂h/∂x(h=H+η),抵消 g·h·η 通量多出的 -g·η·∂h/∂x,
         // 使动量方程精确回到 -g·h·∂η/∂x(正确 Green 定律浅水放大);η=0 时源项为 0,严格静水平衡
-        const im1 = j * nx + this.ix(i - 1);
-        const ip1 = j * nx + this.ix(i + 1);
+        const im1 = j * nx + this.ix(i - s);
+        const ip1 = j * nx + this.ix(i + s);
         const jm1 = this.iy(j - 1) * nx + i;
         const jp1 = this.iy(j + 1) * nx + i;
         const dhdx = ((H[ip1] + e[ip1]) - (H[im1] + e[im1])) / (2 * dxe);
@@ -347,6 +389,36 @@ export class CpuSolver {
       eta[k] = eC;
       hu[k] = uC;
       hv[k] = vC;
+    }
+    // 辐射边界(特征投影):把边界单元投影到出射特征、令入射特征为零。
+    // 右边界出右行波 w+=η+hu/c → η=w+/2, hu=c·w+/2;左边界出左行波 w−=η−hu/c 对称。
+    // 等价于单向波方程 ∂tφ=−c·∂nφ 的稳态投影,让出海波透射、把反射压到 <2%。
+    if (this.radiation) {
+      const { radXnb, radYnb, nx } = this;
+      for (let k = 0; k < eta.length; k++) {
+        const hasX = radXnb[k] >= 0, hasY = radYnb[k] >= 0;
+        if (!hasX && !hasY) continue;
+        const c = Math.sqrt(GRAVITY * H[k]);
+        if (c <= 0) continue; // 陆地边界:η 冻结、无出射波
+        if (hasX) {
+          if (radXnb[k] === k - 1) {           // 右边界:出射右行波
+            const wp = eta[k] + hu[k] / c;
+            eta[k] = 0.5 * wp; hu[k] = 0.5 * c * wp;
+          } else {                              // 左边界:出射左行波
+            const wm = eta[k] - hu[k] / c;
+            eta[k] = 0.5 * wm; hu[k] = -0.5 * c * wm;
+          }
+        }
+        if (hasY) {
+          if (radYnb[k] === k - nx) {          // 上边界:出射上行波
+            const wp = eta[k] + hv[k] / c;
+            eta[k] = 0.5 * wp; hv[k] = 0.5 * c * wp;
+          } else {                              // 下边界:出射下行波
+            const wm = eta[k] - hv[k] / c;
+            eta[k] = 0.5 * wm; hv[k] = -0.5 * c * wm;
+          }
+        }
+      }
     }
   }
 }

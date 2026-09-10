@@ -29,25 +29,29 @@ void main() {
   float tx = uTexel.x;
   float ty = uTexel.y;
 
-  vec4 c = texture2D(uState, uv);
-  vec4 l = texture2D(uState, uv + vec2(-tx, 0.0));
-  vec4 r = texture2D(uState, uv + vec2( tx, 0.0));
-  vec4 d = texture2D(uState, uv + vec2(0.0, -ty));
-  vec4 u = texture2D(uState, uv + vec2(0.0,  ty));
-
   float bed = texture2D(uBathymetry, uv).r;
   float H   = max(-bed, 0.0);          // 静水深度
   float wet = step(1.0, H);            // 水深 > 1 m 视为水域
 
-  // 球面度量:经向格距随纬度收缩。
-  // 二维 LF 稳定条件是两方向库朗数之和 νx+νy ≤ 1;纬向 νy ≈ 0.39,
-  // 故极地下限取 2.2·dt·√(gH),使极点处 νx ≤ 1/2.2 ≈ 0.45,总和 < 0.85。
-  // 代价:高纬有效格距变大,波速略失真(教学级可接受)
+  // 缩减纬网:高纬经向格距 dx·cosφ 收缩会迫使 dt→0;改每 k 列合并(stride-k 采样),
+  // dxEff=k·dx·cosφ 保持有限 → 去除旧 cflFloor hack,极地波速恢复正确(与 V2/CPU kLat 同构)。
   float lat = (uv.y - 0.5) * 168.0;    // 全球域纬度范围 ±84°
-  float cflFloor = uDt * sqrt(uG * max(H, 0.0)) * 2.2 + 100.0;
+  float absLat = abs(lat);
+  int k = 1;
+  if (uGlobeMode > 0.5) {
+    if (absLat > 80.0) k = 4;
+    else if (absLat > 74.0) k = 2;
+  }
   float dxEff = uGlobeMode > 0.5
-      ? max(uDx * cos(max(abs(lat), 5.0) * 0.017453293), cflFloor)
+      ? float(k) * uDx * cos(max(absLat, 5.0) * 0.017453293)
       : uDx;
+  float kx = float(k) * tx;            // 经向 stride-k 采样偏移(uv 单位)
+
+  vec4 c = texture2D(uState, uv);
+  vec4 l = texture2D(uState, uv + vec2(-kx, 0.0));
+  vec4 r = texture2D(uState, uv + vec2( kx, 0.0));
+  vec4 d = texture2D(uState, uv + vec2(0.0, -ty));
+  vec4 u = texture2D(uState, uv + vec2(0.0,  ty));
 
   // Lax–Friedrichs 邻域平均,保证显式格式稳定
   vec4 avg = 0.25 * (l + r + d + u);
@@ -116,14 +120,15 @@ ivec2 cellIdx(int i, int j) {
 vec4 cellState(ivec2 c) { return texture2D(uState, (vec2(c) + 0.5) * uTexel); }
 float cellDepth(ivec2 c) { return max(-texture2D(uBathymetry, (vec2(c) + 0.5) * uTexel).r, 0.0); }
 
-// x 方向界面 (i+1/2, 行 j) 通量:入参 q=(i,j),与 CPU fluxX(i,j) 同构
-vec3 musclFluxX(ivec2 q) {
-  vec4 A = cellState(cellIdx(q.x - 1, q.y));
+// x 方向界面通量:入参 q=(i,j) + 缩减纬网 stride k,界面位于 cell i 与 i+k 之间,
+// 重构取 i-k/i/i+k/i+2k(与 CPU fluxX(i,j,st) 同构;k=1 时退化为常规 i+1/2 界面)
+vec3 musclFluxX(ivec2 q, int k) {
+  vec4 A = cellState(cellIdx(q.x - k, q.y));
   vec4 B = cellState(cellIdx(q.x,     q.y));
-  vec4 C = cellState(cellIdx(q.x + 1, q.y));
-  vec4 D = cellState(cellIdx(q.x + 2, q.y));
+  vec4 C = cellState(cellIdx(q.x + k, q.y));
+  vec4 D = cellState(cellIdx(q.x + 2 * k, q.y));
   float HB = cellDepth(cellIdx(q.x,     q.y));
-  float HC = cellDepth(cellIdx(q.x + 1, q.y));
+  float HC = cellDepth(cellIdx(q.x + k, q.y));
   vec3 sL = vec3(minmod(B.r - A.r, C.r - B.r), minmod(B.g - A.g, C.g - B.g), minmod(B.b - A.b, C.b - B.b));
   vec3 sR = vec3(minmod(C.r - B.r, D.r - C.r), minmod(C.g - B.g, D.g - C.g), minmod(C.b - B.b, D.b - C.b));
   float eL = B.r + 0.5 * sL.x, eR = C.r - 0.5 * sR.x;
@@ -175,6 +180,13 @@ uniform float uManning;   // 曼宁摩擦系数 n(0 关闭)
 uniform float uDiag;      // DEV 诊断:1 = 直接输出 L 算子(不推进)
 uniform sampler2D u0;   // 阶段 B 的 RK2 基态 U0
 
+// 2 单元薄海绵兜底因子:辐射边界单元(d=0)不阻尼(交由辐射 BC 精确透射),
+// 内侧 d=1,2 温和动量阻尼(与 cpuSolver.thinSpongeFactor 同构)。GLSL ES 1.00 无 int min,用三元。
+float thinSponge(int d) {
+  if (d <= 0 || d >= 3) return 1.0;
+  return 1.0 - 0.08 * float(3 - d) / 2.0;
+}
+
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   vec2 uv = gl_FragCoord.xy / uRes;
@@ -183,17 +195,23 @@ void main() {
   float H = max(-bed, 0.0);
   float wet = step(uHMin, H);   // 1 = 水域(静水深 ≥ hMin),0 = 永久陆地
 
-  // 球面度量:经向格距随纬度收缩 + 极地 CFL 下限保护(与 LF/CPU 镜像同构)
+  // 缩减纬网:高纬经向每 k 列合并(stride-k 采样),dxEff=k·uDx·cosφ 保持有限;
+  // 去除旧 cflFloor hack → 极地波速恢复正确(与 CPU kLat/dxEff、LF 着色器同构)
   float lat = (uv.y - 0.5) * 168.0;
-  float cflFloor = uDt * sqrt(uG * H) * 2.2 + 100.0;
+  float absLat = abs(lat);
+  int k = 1;
+  if (uGlobeMode > 0.5) {
+    if (absLat > 80.0) k = 4;
+    else if (absLat > 74.0) k = 2;
+  }
   float dxEff = uGlobeMode > 0.5
-      ? max(uDx * cos(max(abs(lat), 5.0) * 0.017453293), cflFloor)
+      ? float(k) * uDx * cos(max(absLat, 5.0) * 0.017453293)
       : uDx;
 
-  // 单元 p 的四界面通量:musclFluxX(q)=界面 q.x+1/2,musclFluxY(q)=界面 q.y+1/2。
-  // 故单元 p 的左/右界面用 q=(p.x-1,p.y)/(p.x,p.y),下/上界面用 q=(p.x,p.y-1)/(p.x,p.y)。
-  vec3 fxm = musclFluxX(ivec2(p.x - 1, p.y));
-  vec3 fxp = musclFluxX(ivec2(p.x,     p.y));
+  // 单元 p 的四界面通量:musclFluxX(q,k)=界面 q.x 与 q.x+k 之间(stride-k),
+  // musclFluxY(q)=界面 q.y+1/2(stride-1)。故单元 p 的左/右界面用 q=(p.x-k,p.y)/(p.x,p.y)。
+  vec3 fxm = musclFluxX(ivec2(p.x - k, p.y), k);
+  vec3 fxp = musclFluxX(ivec2(p.x,     p.y), k);
   vec3 fym = musclFluxY(ivec2(p.x, p.y - 1));
   vec3 fyp = musclFluxY(ivec2(p.x, p.y));
   vec3 L = -vec3(
@@ -202,10 +220,10 @@ void main() {
     (fxp.z - fxm.z) / dxEff + (fyp.z - fym.z) / uDy);
 
   // 井平衡源项 g·η·∂h/∂x(h=H+η):抵消 g·h·η 通量多出的地形项,使动量方程
-  // 精确回到 -g·h·∂η/∂x;η=0 时源项为 0 → 严格静水平衡(与 cpuSolver.computeL 同构)
+  // 精确回到 -g·h·∂η/∂x;η=0 时源项为 0 → 严格静水平衡(经向用 ±k 邻居,与 stride 一致)
   float etaC = texture2D(uState, uv).r;
-  float hIp = cellDepth(cellIdx(p.x + 1, p.y)) + cellState(cellIdx(p.x + 1, p.y)).r;
-  float hIm = cellDepth(cellIdx(p.x - 1, p.y)) + cellState(cellIdx(p.x - 1, p.y)).r;
+  float hIp = cellDepth(cellIdx(p.x + k, p.y)) + cellState(cellIdx(p.x + k, p.y)).r;
+  float hIm = cellDepth(cellIdx(p.x - k, p.y)) + cellState(cellIdx(p.x - k, p.y)).r;
   float hJp = cellDepth(cellIdx(p.x, p.y + 1)) + cellState(cellIdx(p.x, p.y + 1)).r;
   float hJm = cellDepth(cellIdx(p.x, p.y - 1)) + cellState(cellIdx(p.x, p.y - 1)).r;
   L.y += uG * etaC * (hIp - hIm) / (2.0 * dxEff);
@@ -226,14 +244,20 @@ void main() {
     vec4 U0 = texture2D(u0, uv);
     vec4 Us = texture2D(uState, uv);
     outState = vec4(0.5 * U0.rgb + 0.5 * (Us.rgb + uDt * L), 1.0);
-    // 边界海绵(仅动量):平面域四边吸收;球面仅两极吸收
-    float edge = uGlobeMode > 0.5
-        ? min(uv.y, 1.0 - uv.y)
-        : min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-    float spongeWidth = uGlobeMode > 0.5 ? 0.03 : 0.06;
-    float sponge = smoothstep(0.0, spongeWidth, edge);
-    outState.g *= sponge;
-    outState.b *= sponge;
+    int nxI = int(uRes.x), nyI = int(uRes.y);
+    // 边界(仅动量):globe 经向周期→仅两极宽海绵;plane→ 2 单元薄海绵兜底
+    // (边界单元 d=0 不阻尼,交由下方辐射 BC 精确透射;与 cpuSolver 薄海绵同构)
+    if (uGlobeMode > 0.5) {
+      float sponge = smoothstep(0.0, 0.03, min(uv.y, 1.0 - uv.y));
+      outState.g *= sponge;
+      outState.b *= sponge;
+    } else {
+      int di = p.x < nxI - 1 - p.x ? p.x : nxI - 1 - p.x;
+      int dj = p.y < nyI - 1 - p.y ? p.y : nyI - 1 - p.y;
+      float sp = thinSponge(di) * thinSponge(dj);
+      outState.g *= sp;
+      outState.b *= sp;
+    }
     // 隐式曼宁摩擦:hu /= 1 + dt·g·n²·|u|/h^(4/3),|u| = √(u²+v²)/h
     float h = max(H + outState.r, uHMin);
     float speed = length(outState.gb) / h;
@@ -244,6 +268,27 @@ void main() {
     outState.g *= wet;
     outState.b *= wet;
     outState.r = mix(U0.r, outState.r, wet);
+    // 辐射边界(特征投影,仅 plane):边界单元投影到出射特征、令入射特征为零,
+    // 让出海波透射、反射压到 <2%(与 cpuSolver.stepV2 辐射 pass 同构;globe 经向周期无需)
+    if (uGlobeMode < 0.5) {
+      float c = sqrt(uG * H);
+      if (c > 0.0) {
+        if (p.x == nxI - 1) {                 // 右边界:出射右行波 w+=η+hu/c
+          float wp = outState.r + outState.g / c;
+          outState.r = 0.5 * wp; outState.g = 0.5 * c * wp;
+        } else if (p.x == 0) {                // 左边界:出射左行波 w−=η−hu/c
+          float wm = outState.r - outState.g / c;
+          outState.r = 0.5 * wm; outState.g = -0.5 * c * wm;
+        }
+        if (p.y == nyI - 1) {                 // 上边界:出射上行波
+          float wp = outState.r + outState.b / c;
+          outState.r = 0.5 * wp; outState.b = 0.5 * c * wp;
+        } else if (p.y == 0) {                // 下边界:出射下行波
+          float wm = outState.r - outState.b / c;
+          outState.r = 0.5 * wm; outState.b = -0.5 * c * wm;
+        }
+      }
+    }
   }
   gl_FragColor = outState;
 }
