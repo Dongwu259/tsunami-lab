@@ -7,6 +7,14 @@ import * as THREE from 'three';
 import { computeStableDt } from './config';
 import { CpuSolver } from './simulation/cpuSolver';
 import { TsunamiSolver } from './simulation/TsunamiSolver';
+import {
+  GLOBE_TERRAIN_VERT,
+  GLOBE_WATER_VERT,
+  TERRAIN_FRAG,
+  TERRAIN_VERT,
+  WATER_FRAG,
+  WATER_VERT,
+} from './simulation/shaders';
 
 const NX = 64;
 const NY = 64;
@@ -19,26 +27,36 @@ function log(msg: string): void {
   if (pre) pre.textContent += msg + '\n';
 }
 
-/** 单场景:同构注入 → L 算子诊断 → 20 步 η/hu 剖面对比 */
+/** 单场景:同构注入 → L 算子诊断 → 20 步 η/hu 剖面对比。
+ * shoreline = true 时用斜坡海岸床面 + 左侧入射波(覆盖干湿前沿路径)。 */
 function runCompare(
   renderer: THREE.WebGLRenderer,
-  dispersion: boolean
+  dispersion: boolean,
+  shoreline = false
 ): void {
-  log(`\n===== 场景:频散 ${dispersion ? '开' : '关'} =====`);
-  const bed = new Float32Array(NX * NY).fill(-H0);
+  log(`\n===== 场景:${shoreline ? '岸线 run-up' : `频散 ${dispersion ? '开' : '关'}`} =====`);
+  const bed = new Float32Array(NX * NY);
+  for (let j = 0; j < NY; j++)
+    for (let i = 0; i < NX; i++) {
+      // 斜坡:左深 4000 m → 右侧抬升为陆地(x > 0.78 为海岸高地)
+      bed[j * NX + i] = shoreline
+        ? Math.min(-H0 + (i / NX) * 5200, 800)
+        : -H0;
+    }
   const dt = computeStableDt(DX, DX, H0);
 
   const gpu = new TsunamiSolver(renderer, bed, NX, NY, DX, DX, false);
   gpu.uniforms.uDispersion.value = dispersion ? 1 : 0;
   const cpu = new CpuSolver({
     nx: NX, ny: NY, dx: DX, dy: DX,
-    bed: new Float64Array(NX * NY).fill(-H0),
+    bed: Float64Array.from(bed),
     dt, scheme: 'v2', damping: 0.9998, dispersion,
   });
 
-  // 相同高斯隆起
-  gpu.inject(0.5, 0.5, 1, 20e3);
-  cpu.inject(0.5, 0.5, 1, 20e3);
+  // 相同高斯隆起(岸线场景放左侧深海,波向右传播爬坡)
+  const cu = shoreline ? 0.3 : 0.5;
+  gpu.inject(cu, 0.5, 1, 10e3);
+  cpu.inject(cu, 0.5, 1, 10e3);
   log(`inject: gpuPeak=${gpu.readPeak().toFixed(6)} cpuPeak=${cpu.readPeak().toFixed(6)}`);
 
   const anyGpu = gpu as unknown as {
@@ -117,14 +135,61 @@ function runCompare(
   gpu.dispose();
 }
 
+/** 渲染着色器编译冒烟测试:水/地形 × 平面/球面 4 材质编译 + 一次离屏渲染。
+ * 捕获 GLSL 语法/链接错误(如 TERRAIN_FRAG 的 uRunup 图层改动)。 */
+function smokeRenderShaders(renderer: THREE.WebGLRenderer): void {
+  const mk = (vert: string, frag: string, extra: Record<string, THREE.IUniform>): THREE.Mesh =>
+    new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      new THREE.ShaderMaterial({
+        vertexShader: vert,
+        fragmentShader: frag,
+        uniforms: {
+          uState: { value: null },
+          uBathymetry: { value: null },
+          uTexel: { value: new THREE.Vector2(1 / 64, 1 / 64) },
+          uWaveScale: { value: 0.045 },
+          uDomainKm: { value: new THREE.Vector2(240, 240) },
+          uTerrainScale: { value: 0.003 },
+          uLandLift: { value: 0.3 },
+          uColorScale: { value: 0.5 },
+          uOpacity: { value: 0.8 },
+          uRunup: { value: null },
+          uRunupOn: { value: 1 },
+          uSeisOn: { value: 0 },
+          uSeisT: { value: 0 },
+          uEpi: { value: new THREE.Vector2(0.5, 0.5) },
+          uEpiGlobe: { value: 0 },
+          uSeisDomKm: { value: new THREE.Vector2(240, 240) },
+          ...extra,
+        },
+      })
+    );
+  const scene = new THREE.Scene();
+  const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  for (const [name, vert, frag] of [
+    ['水面(平面)', WATER_VERT, WATER_FRAG],
+    ['地形(平面,含淹没图层)', TERRAIN_VERT, TERRAIN_FRAG],
+    ['水面(球面)', GLOBE_WATER_VERT, WATER_FRAG],
+    ['地形(球面,含淹没图层)', GLOBE_TERRAIN_VERT, TERRAIN_FRAG],
+  ] as [string, string, string][]) {
+    scene.add(mk(vert, frag, {}));
+    renderer.render(scene, cam);
+    log(`着色器编译+离屏渲染 OK:${name}`);
+    scene.clear();
+  }
+}
+
 function main(): void {
   const renderer = new THREE.WebGLRenderer({ antialias: false });
   renderer.setSize(64, 64);
   document.body.appendChild(renderer.domElement);
   log(`WebGL2=${renderer.capabilities.isWebGL2}`);
+  smokeRenderShaders(renderer);
 
   runCompare(renderer, false);
   runCompare(renderer, true);
+  runCompare(renderer, false, true);
 }
 
 main();

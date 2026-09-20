@@ -18,6 +18,8 @@ export interface SimParams {
   showTerrain: boolean;
   /** P/S 波圈(地震体波扩散可视化) */
   showSeismic: boolean;
+  /** 淹没范围图层(累计最大 run-up 的地形着色叠加) */
+  showInundation: boolean;
   wireframe: boolean;
   magnitude: number;
   radiusKm: number;
@@ -46,6 +48,7 @@ export interface PanelCallbacks {
   onWaterOpacityChange(opacity: number): void;
   onTerrainVisible(visible: boolean): void;
   onSeismicVisible(visible: boolean): void;
+  onInundationVisible(visible: boolean): void;
   onWireframe(on: boolean): void;
   onLoadTohoku(): void;
   onLoadGlobe(): void;
@@ -86,6 +89,7 @@ export function createPanel(cb: PanelCallbacks): PanelHandle {
     waterOpacity: 0.8,
     showTerrain: true,
     showSeismic: true,
+    showInundation: false,
     wireframe: false,
     magnitude: 8.5,
     radiusKm: 18,
@@ -224,6 +228,10 @@ export function createPanel(cb: PanelCallbacks): PanelHandle {
     .add(params, 'showSeismic')
     .name('P/S 波圈')
     .onChange((v: boolean) => cb.onSeismicVisible(v));
+  view
+    .add(params, 'showInundation')
+    .name('淹没范围(累计)')
+    .onChange((v: boolean) => cb.onInundationVisible(v));
   view
     .add(params, 'wireframe')
     .name('线框模式')

@@ -39,6 +39,8 @@ export class SceneApp {
   private smoothBathyOwned = false;
   /** 海面不透明度(跨模式保留用户设置) */
   private waterOpacity = 0.8;
+  /** 淹没范围图层开关(跨模式保留用户设置) */
+  private inundationOn = false;
 
   /** 渲染网格分辨率(可高于求解网格,仅影响地形/海面细节)
    *  null = 跟随求解网格 */
@@ -233,6 +235,8 @@ export class SceneApp {
           uTerrainScale: { value: 0.0012 },
           // 略大于球壳半径差(0.002R),保证任意夸张系数下陆地都在水面球之上
           uLandLift: { value: GLOBE_RADIUS * 0.0025 },
+          uRunup: { value: null },
+          uRunupOn: { value: this.inundationOn ? 1 : 0 },
           ...this.seisUniforms(true),
         },
       });
@@ -262,6 +266,8 @@ export class SceneApp {
           uTexel: { value: rTexel },
           uTerrainScale: { value: 0.003 },
           uDomainKm: { value: this.domainKm },
+          uRunup: { value: null },
+          uRunupOn: { value: this.inundationOn ? 1 : 0 },
           ...this.seisUniforms(false),
         },
       });
@@ -379,9 +385,16 @@ export class SceneApp {
     this.renderer.setSize(container.clientWidth, container.clientHeight);
   }
 
-  /** 每帧同步最新状态纹理 */
+  /** 每帧同步最新状态纹理(与 run-up 累计纹理) */
   syncState(solver: TsunamiSolver): void {
     this.waterMat.uniforms.uState.value = solver.stateTexture;
+    this.terrainMat.uniforms.uRunup.value = solver.runupTexture;
+  }
+
+  /** 淹没范围图层开关(累计 run-up 纹理的地形着色叠加) */
+  setInundationVisible(on: boolean): void {
+    this.inundationOn = on;
+    this.terrainMat.uniforms.uRunupOn.value = on ? 1 : 0;
   }
 
   /** 设置垂直夸张系数(同时作用于波形与地形,按模式取不同基准) */

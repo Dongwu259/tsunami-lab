@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { computeStableDt, GRAVITY, H_MIN, MANNING_N, GLOBE_LAT_SPAN, reducedGridMinFactor } from '../config';
-import { INJECT_FRAG, STEP_FRAG, STEP_FRAG_V2 } from './shaders';
+import { INJECT_FRAG, RUNUP_FRAG, STEP_FRAG, STEP_FRAG_V2 } from './shaders';
 
 /** 用于将纹理填充为常数的极简着色器 */
 const FILL_FRAG = /* glsl */ `
@@ -55,16 +55,21 @@ export class TsunamiSolver {
   private rts: [THREE.WebGLRenderTarget, THREE.WebGLRenderTarget];
   /** RK2 中间级 U* 暂存目标(不参与 ping-pong) */
   private rtU0: THREE.WebGLRenderTarget;
+  /** 累计最大水深(run-up 统计)ping-pong 对 + 当前索引 */
+  private rtRunup: [THREE.WebGLRenderTarget, THREE.WebGLRenderTarget];
+  private runupCur = 0;
   private cur = 0;
   private lfMaterial: THREE.ShaderMaterial;
   private v2Material: THREE.ShaderMaterial;
   private injectMaterial: THREE.ShaderMaterial;
   private fillMaterial: THREE.ShaderMaterial;
   private copyMaterial: THREE.ShaderMaterial;
+  private runupMaterial: THREE.ShaderMaterial;
   private quadScene = new THREE.Scene();
   private fillScene = new THREE.Scene();
   private copyScene = new THREE.Scene();
   private injectScene = new THREE.Scene();
+  private runupScene = new THREE.Scene();
   private camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
   /** 求解器 uniform(供外部调整阻尼、格式开关等) */
@@ -138,6 +143,7 @@ export class TsunamiSolver {
     };
     this.rts = [mkRt(), mkRt()];
     this.rtU0 = mkRt();
+    this.rtRunup = [mkRt(), mkRt()];
 
     // --- 共享 uniforms(步进/注入材质共用同一批对象) ---
     this.uniforms = {
@@ -154,6 +160,7 @@ export class TsunamiSolver {
       uManning: { value: MANNING_N }, // V2 隐式曼宁摩擦系数 n
       uDispersion: { value: 0 },      // V2 可选频率频散(0 关;LF 不支持)
       uHMin: { value: H_MIN },        // 干单元阈值(m)
+      uRunupOn: { value: 0 },         // 累计 run-up 统计开关(淹没图层开启时 >0)
       uGlobeMode: { value: globeMode ? 1 : 0 },
       uScheme: { value: scheme },
       uStage: { value: 0 },
@@ -201,6 +208,14 @@ export class TsunamiSolver {
     });
     this.copyScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.copyMaterial));
 
+    // 累计 run-up 统计材质(max-pool 当前水深)
+    this.runupMaterial = new THREE.ShaderMaterial({
+      uniforms: share(),
+      vertexShader: FILL_VERT,
+      fragmentShader: RUNUP_FRAG,
+    });
+    this.runupScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.runupMaterial));
+
     const quadLf = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.lfMaterial);
     quadLf.frustumCulled = false;
     this.quadScene.add(quadLf);
@@ -237,9 +252,29 @@ export class TsunamiSolver {
     return this.curRt.texture;
   }
 
+  /** 最新累计最大水深纹理(淹没图层采样;run-up 统计开启时每子步更新) */
+  get runupTexture(): THREE.Texture {
+    return this.rtRunup[this.runupCur].texture;
+  }
+
+  /** 清零累计 run-up(新事件开始:重置海面/注入震源/载入 η 场时调用) */
+  private clearRunup(): void {
+    for (const rt of this.rtRunup) this.pass(this.fillScene, rt);
+  }
+
+  /** 每子步累计 run-up:读当前状态 + 上一帧 run-up,写 max(覆盖式 ping-pong) */
+  private updateRunup(): void {
+    const mat = this.runupMaterial.uniforms;
+    mat.uState.value = this.curRt.texture;
+    mat.uRunup.value = this.rtRunup[this.runupCur].texture;
+    this.pass(this.runupScene, this.rtRunup[1 - this.runupCur]);
+    this.runupCur = 1 - this.runupCur;
+  }
+
   /** 推进 substeps 个子步 */
   step(substeps: number): void {
     const v2 = (this.uniforms.uScheme.value as number) > 0.5;
+    const trackRunup = (this.uniforms.uRunupOn.value as number) > 0.5;
     for (let i = 0; i < substeps; i++) {
       if (!v2) {
         this.bindStepMaterial();
@@ -260,6 +295,7 @@ export class TsunamiSolver {
         this.pass(this.quadScene, this.otherRt);
         this.cur = 1 - this.cur;
       }
+      if (trackRunup) this.updateRunup();
     }
   }
 
@@ -280,11 +316,13 @@ export class TsunamiSolver {
     this.uniforms.uState.value = this.curRt.texture;
     this.pass(this.injectScene, this.otherRt);
     this.cur = 1 - this.cur;
+    this.clearRunup();   // 新事件:累计 run-up 归零
   }
 
   /** 重置为平静海面 */
   reset(): void {
     this.fill(0);
+    this.clearRunup();
   }
 
   private fill(value: number): void {
@@ -335,6 +373,7 @@ export class TsunamiSolver {
       this.pass(this.copyScene, this.otherRt);
       this.cur = 1 - this.cur;
     }
+    this.clearRunup();   // 新事件(注入/回放):累计 run-up 归零
     tex.dispose();
   }
 
@@ -357,11 +396,13 @@ export class TsunamiSolver {
   dispose(): void {
     for (const rt of this.rts) rt.dispose();
     this.rtU0.dispose();
+    for (const rt of this.rtRunup) rt.dispose();
     this.bathyTexture.dispose();
     this.lfMaterial.dispose();
     this.v2Material.dispose();
     this.injectMaterial.dispose();
     this.fillMaterial.dispose();
     this.copyMaterial.dispose();
+    this.runupMaterial.dispose();
   }
 }

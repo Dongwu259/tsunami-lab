@@ -137,6 +137,10 @@ export class TsunamiApp {
       onWaterOpacityChange: (o) => this.sceneApp.setWaterOpacity(o),
       onTerrainVisible: (v) => this.sceneApp.setTerrainVisible(v),
       onSeismicVisible: (v) => this.sceneApp.setSeismicVisible(v),
+      onInundationVisible: (v) => {
+        this.solver.uniforms.uRunupOn.value = v ? 1 : 0;
+        this.sceneApp.setInundationVisible(v);
+      },
       onWireframe: (v) => this.sceneApp.setWireframe(v),
       onLoadTohoku: () => this.loadTohoku(),
       onLoadGlobe: () => this.loadGlobe(),
@@ -207,6 +211,9 @@ export class TsunamiApp {
     this.solver.uniforms.uManning.value = this.panel.params.manning;
     this.solver.uniforms.uDispersion.value =
       this.panel.params.dispersion ? 1 : 0;
+    this.solver.uniforms.uRunupOn.value =
+      this.panel.params.showInundation ? 1 : 0;
+    this.sceneApp.setInundationVisible(this.panel.params.showInundation);
     // 高分辨率渲染纹理:RGBA 浮点(r = 高程),与求解器 bathyTexture 格式一致;
     // 旧纹理由 setRenderBathy 内部统一 dispose
     if (renderSize && hiResGrid) {

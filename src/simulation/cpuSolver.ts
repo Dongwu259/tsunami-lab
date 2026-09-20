@@ -72,6 +72,10 @@ export class CpuSolver {
   hv: Float64Array;
 
   private readonly H: Float64Array;
+  /** 原始海床高程(正 = 陆地;干湿界面静水重构需要,H=max(−bed,0) 会丢掉陆地正高程) */
+  private readonly bedRaw: Float64Array;
+  /** 累计最大水深 max(H+η)(run-up 统计;GPU 侧对应 rtRunup 纹理) */
+  readonly maxH: Float64Array;
   /** 逐单元经向有效格距(缩减纬网 dxEff=k·dx·cosφ,与着色器同构) */
   private readonly dxEff: Float64Array;
   /** 逐纬向行缩减纬网 stride k(|φ|>74°→2,>80°→4;plane 全 1) */
@@ -91,6 +95,9 @@ export class CpuSolver {
   /** 界面通量暂存(x / y 方向各三分量) */
   private fx = [0, 0, 0];
   private fy = [0, 0, 0];
+  /** 刚计算的界面是否为干湿前沿(true = frontFlux* 生成的通量) */
+  private fxIsFront = false;
+  private fyIsFront = false;
 
   constructor(o: CpuSolverOptions) {
     this.nx = o.nx;
@@ -108,6 +115,8 @@ export class CpuSolver {
     this.radiation = o.radiation ?? !(o.globe ?? false);
     const n = o.nx * o.ny;
     this.H = new Float64Array(n);
+    this.bedRaw = Float64Array.from(o.bed);
+    this.maxH = new Float64Array(n);
     this.dxEff = new Float64Array(n);
     this.kLat = new Int32Array(o.ny).fill(1);
     this.sponge = new Float64Array(n);
@@ -164,6 +173,17 @@ export class CpuSolver {
     }
   }
 
+  /**
+   * 干湿前沿判定:界面任一侧重构水深 < max(4·hMin, 5%·深侧) 即视为前沿。
+   * 阈值须明显高于 hMin:内部 MUSCL(η 重构配错侧 H)在近干浅单元会过度抽取,
+   * 阶段 B 薄膜钳位削掉负水深 = 删水(实测 Thacker 晃荡 1.3%/周期质量泄漏);
+   * 前沿用单元中心态 Rusanov,CFL ≤ 0.5 下不会过度抽取浅侧。陡坡深水界面
+   * (相邻水深比 > 5%)不受影响,保持二阶。
+   */
+  private isFront(hL: number, hR: number): boolean {
+    return hL < this.hMin || hR < this.hMin;
+  }
+
   private ix(i: number): number {
     if (this.globe || this.periodicX) return ((i % this.nx) + this.nx) % this.nx;
     return i < 0 ? 0 : i >= this.nx ? this.nx - 1 : i;
@@ -210,6 +230,17 @@ export class CpuSolver {
   step(): void {
     if (this.scheme === 'lf') this.stepLf();
     else this.stepV2();
+    // 累计最大水深(run-up 统计;h 步末恒 ≥ 0:湿单元正常、薄膜/陆地已钳制)
+    const { H, eta, maxH } = this;
+    for (let k = 0; k < eta.length; k++) {
+      const h = H[k] + eta[k];
+      if (h > maxH[k]) maxH[k] = h;
+    }
+  }
+
+  /** 清零累计最大水深(新事件开始;GPU 侧 reset/inject 时清 run-up 纹理) */
+  resetRunup(): void {
+    this.maxH.fill(0);
   }
 
   // ---------------------------------------------------------------- LF(镜像旧格式)
@@ -276,17 +307,57 @@ export class CpuSolver {
     const uR = this.hu[c] - 0.5 * sR[1];
     const vL = this.hv[b] + 0.5 * sL[2];
     const vR = this.hv[c] - 0.5 * sR[2];
-    // 非线性总水深 h=H+η;干床(h<hMin)界面通量置零(与 GPU musclFluxX 同构)
+    // 非线性总水深 h=H+η;干床(h<hMin)界面改用静水重构保正通量(与 GPU frontFluxX 同构)
     const hL = H[b] + eL;
     const hR = H[c] + eR;
-    if (hL < this.hMin || hR < this.hMin) {
-      this.fx[0] = 0; this.fx[1] = 0; this.fx[2] = 0;
+    if (this.isFront(hL, hR)) {
+      this.fxIsFront = true;
+      this.frontFluxX(b, c);
       return;
     }
+    this.fxIsFront = false;
     const s = Math.sqrt(GRAVITY * Math.max(hL, hR));
     this.fx[0] = 0.5 * (uL + uR) - 0.5 * s * (eR - eL);
     this.fx[1] = 0.5 * GRAVITY * (hL * eL + hR * eR) - 0.5 * s * (uR - uL);
     this.fx[2] = -0.5 * s * (vR - vL);
+  }
+
+  /**
+   * 干湿界面(front)通量:静水重构(Audusse HR)+ 内部 η 形式 Rusanov 通量作用在
+   * 重构状态上(与 GPU frontFluxX 同构)。触发条件:MUSCL 重构出任一侧 h < hMin
+   * (旧实现为置零 → 水永远上不了岸)。
+   * - 重构:界面两侧柱体截断到界面最高床面 z = max(bed_L, bed_R) 之上,
+   *   h* = max(0, h + bed − z),表面 η* = z + h*(速度保持:hu* = u·h*)
+   * - 通量 = 内部 Rusanov 通量函数代入 (η*, hu*, hv*):静水平衡时两侧 η* 同为 z
+   *   → 全分量通量严格 0(lake-at-rest 精确);海面(η_L)高于滩顶(z)时
+   *   质量通量 ∝ (η_L − z) 流上陆(run-up),低于滩顶自动断流(床面感知)
+   * - 状态向量统一(耗散与压力都作用在 η* 跳变上)→ 与内部格式同构的稳定性;
+   *   注意耗散若用 h 跳变而压力用 η* 跳变会错配,陆上池沼棋盘模态无阻尼爆炸
+   * - 单元中心态一阶(不用 MUSCL 外推),前沿鲁棒
+   */
+  private frontFluxX(b: number, c: number): void {
+    const { H, eta, hu, hv } = this;
+    const zB = this.bedRaw[b], zC = this.bedRaw[c];
+    const hB0 = Math.max(H[b] + eta[b], 0);
+    const hC0 = Math.max(H[c] + eta[c], 0);
+    const z = Math.max(zB, zC);
+    const hL = Math.max(0, hB0 + zB - z);
+    const hR = Math.max(0, hC0 + zC - z);
+    if (hL < this.hMin && hR < this.hMin) {
+      this.fx[0] = 0; this.fx[1] = 0; this.fx[2] = 0;
+      return;
+    }
+    const uL = hB0 > this.hMin ? hu[b] / hB0 : 0;
+    const uR = hC0 > this.hMin ? hu[c] / hC0 : 0;
+    const vL = hB0 > this.hMin ? hv[b] / hB0 : 0;
+    const vR = hC0 > this.hMin ? hv[c] / hC0 : 0;
+    const huL = uL * hL, huR = uR * hR;
+    const hvL = vL * hL, hvR = vR * hR;
+    const eL = z + hL, eR = z + hR;   // 重构表面 η*
+    const s = Math.max(Math.abs(uL), Math.abs(uR)) + Math.sqrt(GRAVITY * Math.max(hL, hR));
+    this.fx[0] = 0.5 * (huL + huR) - 0.5 * s * (eR - eL);
+    this.fx[1] = 0.5 * GRAVITY * (hL * eL + hR * eR) - 0.5 * s * (huR - huL);
+    this.fx[2] = -0.5 * s * (hvR - hvL);
   }
 
   /** y 方向界面 j+1/2 通量 → this.fy */
@@ -310,17 +381,45 @@ export class CpuSolver {
     const uR = this.hu[c] - 0.5 * sR[1];
     const vL = this.hv[b] + 0.5 * sL[2];
     const vR = this.hv[c] - 0.5 * sR[2];
-    // 非线性总水深 h=H+η;干床(h<hMin)界面通量置零(与 GPU musclFluxY 同构)
+    // 非线性总水深 h=H+η;干床(h<hMin)界面改用静水重构保正通量(与 GPU frontFluxY 同构)
     const hL = H[b] + eL;
     const hR = H[c] + eR;
-    if (hL < this.hMin || hR < this.hMin) {
-      this.fy[0] = 0; this.fy[1] = 0; this.fy[2] = 0;
+    if (this.isFront(hL, hR)) {
+      this.fyIsFront = true;
+      this.frontFluxY(b, c);
       return;
     }
+    this.fyIsFront = false;
     const s = Math.sqrt(GRAVITY * Math.max(hL, hR));
     this.fy[0] = 0.5 * (vL + vR) - 0.5 * s * (eR - eL);
     this.fy[1] = -0.5 * s * (uR - uL);
     this.fy[2] = 0.5 * GRAVITY * (hL * eL + hR * eR) - 0.5 * s * (vR - vL);
+  }
+
+  /** y 方向干湿界面通量(frontFluxX 的镜像,与 GPU frontFluxY 同构) */
+  private frontFluxY(b: number, c: number): void {
+    const { H, eta, hu, hv } = this;
+    const zB = this.bedRaw[b], zC = this.bedRaw[c];
+    const hB0 = Math.max(H[b] + eta[b], 0);
+    const hC0 = Math.max(H[c] + eta[c], 0);
+    const z = Math.max(zB, zC);
+    const hL = Math.max(0, hB0 + zB - z);
+    const hR = Math.max(0, hC0 + zC - z);
+    if (hL < this.hMin && hR < this.hMin) {
+      this.fy[0] = 0; this.fy[1] = 0; this.fy[2] = 0;
+      return;
+    }
+    const uL = hB0 > this.hMin ? hu[b] / hB0 : 0;
+    const uR = hC0 > this.hMin ? hu[c] / hC0 : 0;
+    const vL = hB0 > this.hMin ? hv[b] / hB0 : 0;
+    const vR = hC0 > this.hMin ? hv[c] / hC0 : 0;
+    const huL = uL * hL, huR = uR * hR;
+    const hvL = vL * hL, hvR = vR * hR;
+    const eL = z + hL, eR = z + hR;   // 重构表面 η*
+    const s = Math.max(Math.abs(uL), Math.abs(uR)) + Math.sqrt(GRAVITY * Math.max(hL, hR));
+    this.fy[0] = 0.5 * (hvL + hvR) - 0.5 * s * (eR - eL);
+    this.fy[1] = -0.5 * s * (huR - huL);
+    this.fy[2] = 0.5 * GRAVITY * (hL * eL + hR * eR) - 0.5 * s * (hvR - hvL);
   }
 
   /** 空间算子 L(U) = -div F → lEta/lHu/lHv */
@@ -360,24 +459,35 @@ export class CpuSolver {
         const k = j * nx + i;
         this.fluxX(i - s, j, s);
         const xm = [this.fx[0], this.fx[1], this.fx[2]];
+        const xmF = this.fxIsFront;
         this.fluxX(i, j, s);
         const xp = this.fx;
+        const xpF = this.fxIsFront;
         this.fluxY(i, j - 1);
         const ym = [this.fy[0], this.fy[1], this.fy[2]];
+        const ymF = this.fyIsFront;
         this.fluxY(i, j);
         const yp = this.fy;
+        const ypF = this.fyIsFront;
         const dxe = this.dxEff[k];
-        // 井平衡源项:g·η·∂h/∂x(h=H+η),抵消 g·h·η 通量多出的 -g·η·∂h/∂x,
-        // 使动量方程精确回到 -g·h·∂η/∂x(正确 Green 定律浅水放大);η=0 时源项为 0,严格静水平衡
-        const im1 = j * nx + this.ix(i - s);
-        const ip1 = j * nx + this.ix(i + s);
-        const jm1 = this.iy(j - 1) * nx + i;
-        const jp1 = this.iy(j + 1) * nx + i;
-        const dhdx = ((H[ip1] + e[ip1]) - (H[im1] + e[im1])) / (2 * dxe);
-        const dhdy = ((H[jp1] + e[jp1]) - (H[jm1] + e[jm1])) / (2 * dy);
         lEta[k] = -((xp[0] - xm[0]) / dxe + (yp[0] - ym[0]) / dy);
-        lHu[k] = -((xp[1] - xm[1]) / dxe + (yp[1] - ym[1]) / dy) + GRAVITY * e[k] * dhdx;
-        lHv[k] = -((xp[2] - xm[2]) / dxe + (yp[2] - ym[2]) / dy) + GRAVITY * e[k] * dhdy;
+        lHu[k] = -((xp[1] - xm[1]) / dxe + (yp[1] - ym[1]) / dy);
+        lHv[k] = -((xp[2] - xm[2]) / dxe + (yp[2] - ym[2]) / dy);
+        // 井平衡源项:g·η·∂h/∂x(h=H+η),抵消 g·h·η 通量多出的 -g·η·∂h/∂x,
+        // 使动量方程精确回到 -g·h·∂η/∂x(正确 Green 定律浅水放大);η=0 时源项为 0,严格静水平衡。
+        // 前沿方向跳过:前沿压力作用在截断柱 h* 上,与未截断 h 的源项配对会双重计入
+        // 岸线地形差(伪源 ~g·η·Δh/(2dx) 破坏晃荡/致发散)。η=0 时本就为 0,静水平衡不受影响。
+        const wetC = H[k] + e[k] >= this.hMin;
+        if (!(wetC && (xmF || xpF))) {
+          const im1 = j * nx + this.ix(i - s);
+          const ip1 = j * nx + this.ix(i + s);
+          lHu[k] += (GRAVITY * e[k] * ((H[ip1] + e[ip1]) - (H[im1] + e[im1]))) / (2 * dxe);
+        }
+        if (!(wetC && (ymF || ypF))) {
+          const jm1 = this.iy(j - 1) * nx + i;
+          const jp1 = this.iy(j + 1) * nx + i;
+          lHv[k] += (GRAVITY * e[k] * ((H[jp1] + e[jp1]) - (H[jm1] + e[jm1]))) / (2 * dy);
+        }
         // 可选频率频散(阶段一致:两 RK2 阶段各自用本阶段 η 求值)。
         // 色散关系 ω² = c²k²(1 − coef·k²)(Peregrine 展开形,O(μ²) 与 Padé 一致)。
         // 系数网格上限:稳定条件 b = coef·k² ≤ 1 须对一切网格模式成立
@@ -411,12 +521,6 @@ export class CpuSolver {
     // 阶段 B:U' = ½U + ½(U* + dt·L(U*)),再叠加算子分裂的修改项
     this.computeL(tEta, tHu, tHv);
     for (let k = 0; k < eta.length; k++) {
-      // 陆地(静水深 H < hMin)为干单元:η 冻结、动量清零(不参与通量 → 质量守恒)
-      if (H[k] < hMin) {
-        hu[k] = 0;
-        hv[k] = 0;
-        continue;
-      }
       const eC = 0.5 * (eta[k] + tEta[k] + dt * lEta[k]);
       let uC = 0.5 * (hu[k] + tHu[k] + dt * lHu[k]);
       let vC = 0.5 * (hv[k] + tHv[k] + dt * lHv[k]);
@@ -431,6 +535,16 @@ export class CpuSolver {
         const cf = (dt * GRAVITY * manning * manning * speed) / Math.pow(h, 4 / 3);
         uC /= 1 + cf;
         vC /= 1 + cf;
+      }
+      // 动态干湿(取代旧静态陆地冻结):步末 h = H+η 决定干湿 ——
+      // 潮间/浅水(H > hMin)保留 hMin 薄膜防负水深;陆地归干(η=0),
+      // 等干湿界面通量把水送上来再自然变湿(run-up)
+      const hEnd = H[k] + eC;
+      if (hEnd < hMin) {
+        eta[k] = H[k] > hMin ? hMin - H[k] : 0;
+        hu[k] = 0;
+        hv[k] = 0;
+        continue;
       }
       eta[k] = eC;
       hu[k] = uC;

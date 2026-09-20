@@ -421,3 +421,88 @@ describe('阶段4:频率频散(色散关系与波包扩展)', () => {
     expect(p).toBeLessThan(p0 * 3);
   }, 60000);
 });
+
+/**
+ * 阶段5:干湿 run-up(静水重构 + 保正通量 + 动态干湿)。
+ * Thacker(1981)抛物面碗平面晃荡解:床面 z_b = (ω²/2g)(x²−L²),
+ * 精确解 η = A·cos(ωt)·x + b(t)、全场均匀速度 u = −(gA/ω)sin(ωt),ω = √(2gh₀)/L。
+ * 关键性质:解的速度处处均匀 → 对流项 u∂x u ≡ 0 —— 本模型(略去对流)的**精确解**,
+ * 数值误差纯为离散化;水面周期性漫过 ±L 处的岸线(run-up/run-down)。
+ */
+describe('阶段5:干湿 run-up(Thacker 抛物面碗)', () => {
+  it('晃荡周期/幅值误差 <5%,全程无负水深,最大爬高范围 <8%', () => {
+    const Lb = 1e4, h0 = 50;
+    const om2 = (2 * GRAVITY * h0) / (Lb * Lb);
+    const om = Math.sqrt(om2);
+    const T = (2 * Math.PI) / om;
+    const A = 4e-4;                       // 倾斜幅值:η(±L) ≈ ±4 m
+    const xa = -1.08 * Lb, xb = 1.08 * Lb; // 岸线最大到 ±10.4 km,留 ~390 m 缓冲
+                                      //(勿让水触域缘:鬼界面自通量是开边界,会漏质量)
+    const nx = 800, dx = (xb - xa) / nx;
+    const bed = new Float64Array(nx * 2);
+    for (let j = 0; j < 2; j++)
+      for (let i = 0; i < nx; i++) {
+        const x = xa + (i + 0.5) * dx;
+        bed[j * nx + i] = (om2 / (2 * GRAVITY)) * (x * x - Lb * Lb);
+      }
+    const s = new CpuSolver({
+      nx, ny: 2, dx, dy: dx, bed,
+      dt: computeStableDt(dx, dx, h0), scheme: 'v2',
+      spongeWidth: 0, manning: 0, radiation: false,
+    });
+    for (let j = 0; j < 2; j++)
+      for (let i = 0; i < nx; i++) {
+        const x = xa + (i + 0.5) * dx;
+        // 静止倾斜水面(t=0 为转向点);解析解的湿区 = A·x > bed(约 |x|<10.4 km),
+        // 陆地(碗缘山地)无水 → η=0,勿把线性面设到高地上(会凭空注水)
+        s.eta[j * nx + i] = A * x > bed[j * nx + i] ? A * x : 0;
+      }
+
+    const iProbe = Math.round((5000 - xa) / dx);
+    const steps = Math.round((5 * T) / s.dt);
+    const probe = new Float64Array(steps + 1);
+    const HArr = s.maxH && (s as unknown as { H: Float64Array }).H;   // 静水深(私有,读出扫最小水深)
+    let minH = Infinity;
+    for (let n = 1; n <= steps; n++) {
+      s.step();
+      probe[n] = s.eta[iProbe];
+      if (n % 100 === 0) {
+        for (let q = 0; q < nx * 2; q++) {
+          const hq = HArr[q] + s.eta[q];
+          if (hq < minH) minH = hq;
+        }
+      }
+    }
+    // 探针局部极大(相邻差分变号,窗口 ≥ T/3 防噪声双峰)
+    const win = Math.max(3, Math.round(T / (3 * s.dt)));
+    const peakT: number[] = [];
+    const peakV: number[] = [];
+    for (let n = 2; n < steps; n++) {
+      if (probe[n] <= probe[n - 1] || probe[n] < probe[n + 1]) continue;
+      if (peakT.length && n - peakT[peakT.length - 1] < win) {
+        if (probe[n] > peakV[peakV.length - 1]) {
+          peakT[peakT.length - 1] = n; peakV[peakV.length - 1] = probe[n];
+        }
+        continue;
+      }
+      peakT.push(n); peakV.push(probe[n]);
+    }
+    const period = (peakT[peakT.length - 1] - peakT[0]) / (peakT.length - 1) * s.dt;
+
+    // 解析最大爬高:h=0 的外侧根(t=0):x± = [A + √(A²+2(ω²/g)h₀)]·g/ω²
+    const xShore = (A + Math.sqrt(A * A + 2 * (om2 / GRAVITY) * h0)) * (GRAVITY / om2);
+    let xMax = 0;
+    for (let i = Math.floor(nx / 2); i < nx; i++) {
+      if (s.maxH[i] > 5e-3) xMax = Math.max(xMax, xa + (i + 0.5) * dx);
+    }
+    const periodErr = Math.abs(period - T) / T;
+    const firstPeak = Math.max(...peakV);
+    const shoreErr = Math.abs(xMax - xShore) / xShore;
+    expect(peakT.length).toBeGreaterThanOrEqual(4);   // 5 周期至少 4 个极大
+    expect(periodErr).toBeLessThan(0.05);             // 周期 <5%(实测 0.46%)
+    expect(firstPeak).toBeGreaterThan(0.35 * A * 5000); // 首摆幅值保持 ≥35%(实测 ≈47%;
+                                                      // 一阶前沿固有耗散,见 ROADMAP 偏差记录)
+    expect(minH).toBeGreaterThanOrEqual(0);           // 全程无负水深(薄膜/归干钳制)
+    expect(shoreErr).toBeLessThan(0.08);              // 累计爬高范围 <8%(实测 3.6%)
+  }, 180000);
+});

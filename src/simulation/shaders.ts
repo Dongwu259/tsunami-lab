@@ -119,10 +119,66 @@ ivec2 cellIdx(int i, int j) {
 
 vec4 cellState(ivec2 c) { return texture2D(uState, (vec2(c) + 0.5) * uTexel); }
 float cellDepth(ivec2 c) { return max(-texture2D(uBathymetry, (vec2(c) + 0.5) * uTexel).r, 0.0); }
+// 原始海床高程(正 = 陆地;cellDepth 只给水深 H,陆地上会丢掉正高程,前沿重构需要)
+float cellBed(ivec2 c) { return texture2D(uBathymetry, (vec2(c) + 0.5) * uTexel).r; }
+
+// 干湿界面(front)通量:静水重构(Audusse HR)+ 内部 η 形式 Rusanov 作用在重构态上
+// (与 cpuSolver.frontFluxX 同构)。h* = max(0, h + bed − z),z = max(bed_L, bed_R),
+// 表面 η* = z + h*(速度保持 hu* = u·h*):静水平衡时两侧 η* 同为 z → 通量严格 0;
+// 海面高于滩顶时质量通量 ∝ (η_L − z) 流上陆(run-up),低于滩顶自动断流。
+// 状态向量统一(耗散与压力都作用在 η* 跳变上)—— 若耗散用 h 跳变而压力用 η*
+// 跳变会错配,陆上池沼棋盘模态无阻尼会爆炸(试过,勿回退)。
+vec3 frontFluxX(ivec2 cB, ivec2 cC) {
+  vec4 sB = cellState(cB), sC = cellState(cC);
+  float zB = cellBed(cB), zC = cellBed(cC);
+  float hB0 = max(cellDepth(cB) + sB.r, 0.0);
+  float hC0 = max(cellDepth(cC) + sC.r, 0.0);
+  float z = max(zB, zC);
+  float hL = max(0.0, hB0 + zB - z);
+  float hR = max(0.0, hC0 + zC - z);
+  if (hL < uHMin && hR < uHMin) return vec3(0.0);
+  float uL = hB0 > uHMin ? sB.g / hB0 : 0.0;
+  float uR = hC0 > uHMin ? sC.g / hC0 : 0.0;
+  float vL = hB0 > uHMin ? sB.b / hB0 : 0.0;
+  float vR = hC0 > uHMin ? sC.b / hC0 : 0.0;
+  float huL = uL * hL, huR = uR * hR;
+  float hvL = vL * hL, hvR = vR * hR;
+  float eL = z + hL, eR = z + hR;   // 重构表面 η*
+  float s = max(abs(uL), abs(uR)) + sqrt(uG * max(hL, hR));
+  return vec3(
+    0.5 * (huL + huR) - 0.5 * s * (eR - eL),
+    0.5 * uG * (hL * eL + hR * eR) - 0.5 * s * (huR - huL),
+    -0.5 * s * (hvR - hvL));
+}
+
+// y 方向镜像(与 cpuSolver.frontFluxY 同构)
+vec3 frontFluxY(ivec2 cB, ivec2 cC) {
+  vec4 sB = cellState(cB), sC = cellState(cC);
+  float zB = cellBed(cB), zC = cellBed(cC);
+  float hB0 = max(cellDepth(cB) + sB.r, 0.0);
+  float hC0 = max(cellDepth(cC) + sC.r, 0.0);
+  float z = max(zB, zC);
+  float hL = max(0.0, hB0 + zB - z);
+  float hR = max(0.0, hC0 + zC - z);
+  if (hL < uHMin && hR < uHMin) return vec3(0.0);
+  float uL = hB0 > uHMin ? sB.g / hB0 : 0.0;
+  float uR = hC0 > uHMin ? sC.g / hC0 : 0.0;
+  float vL = hB0 > uHMin ? sB.b / hB0 : 0.0;
+  float vR = hC0 > uHMin ? sC.b / hC0 : 0.0;
+  float huL = uL * hL, huR = uR * hR;
+  float hvL = vL * hL, hvR = vR * hR;
+  float eL = z + hL, eR = z + hR;
+  float s = max(abs(uL), abs(uR)) + sqrt(uG * max(hL, hR));
+  return vec3(
+    0.5 * (hvL + hvR) - 0.5 * s * (eR - eL),
+    -0.5 * s * (huR - huL),
+    0.5 * uG * (hL * eL + hR * eR) - 0.5 * s * (hvR - hvL));
+}
 
 // x 方向界面通量:入参 q=(i,j) + 缩减纬网 stride k,界面位于 cell i 与 i+k 之间,
-// 重构取 i-k/i/i+k/i+2k(与 CPU fluxX(i,j,st) 同构;k=1 时退化为常规 i+1/2 界面)
-vec3 musclFluxX(ivec2 q, int k) {
+// 重构取 i-k/i/i+k/i+2k(与 CPU fluxX(i,j,st) 同构;k=1 时退化为常规 i+1/2 界面)。
+// 返回 vec4:(质量, x动量, y动量, 是否干湿前沿)—— 前沿时改用 frontFluxX(与 CPU isFront 分支同构)
+vec4 musclFluxX(ivec2 q, int k) {
   vec4 A = cellState(cellIdx(q.x - k, q.y));
   vec4 B = cellState(cellIdx(q.x,     q.y));
   vec4 C = cellState(cellIdx(q.x + k, q.y));
@@ -134,18 +190,22 @@ vec3 musclFluxX(ivec2 q, int k) {
   float eL = B.r + 0.5 * sL.x, eR = C.r - 0.5 * sR.x;
   float uL = B.g + 0.5 * sL.y, uR = C.g - 0.5 * sR.y;
   float vL = B.b + 0.5 * sL.z, vR = C.b - 0.5 * sR.z;
-  // 非线性总水深 h=H+η;干床(h<uHMin)界面通量置零(与 cpuSolver.fluxX 同构)
+  // 非线性总水深 h=H+η;干床(h<uHMin)界面改用静水重构保正通量(与 cpuSolver.fluxX 同构)
   float hL = HB + eL, hR = HC + eR;
-  if (hL < uHMin || hR < uHMin) return vec3(0.0);
+  if (hL < uHMin || hR < uHMin) {
+    return vec4(frontFluxX(cellIdx(q.x, q.y), cellIdx(q.x + k, q.y)), 1.0);
+  }
   float s = sqrt(uG * max(hL, hR));
-  return vec3(
+  return vec4(
     0.5 * (uL + uR) - 0.5 * s * (eR - eL),
     0.5 * uG * (hL * eL + hR * eR) - 0.5 * s * (uR - uL),
-    -0.5 * s * (vR - vL));
+    -0.5 * s * (vR - vL),
+    0.0);
 }
 
-// y 方向界面 (列 i, j+1/2) 通量:入参 q=(i,j),与 CPU fluxY(i,j) 同构
-vec3 musclFluxY(ivec2 q) {
+// y 方向界面 (列 i, j+1/2) 通量:入参 q=(i,j),与 CPU fluxY(i,j) 同构。
+// 返回 vec4:(质量, x动量, y动量, 是否干湿前沿)
+vec4 musclFluxY(ivec2 q) {
   vec4 A = cellState(cellIdx(q.x, q.y - 1));
   vec4 B = cellState(cellIdx(q.x, q.y));
   vec4 C = cellState(cellIdx(q.x, q.y + 1));
@@ -157,14 +217,17 @@ vec3 musclFluxY(ivec2 q) {
   float eL = B.r + 0.5 * sL.x, eR = C.r - 0.5 * sR.x;
   float uL = B.g + 0.5 * sL.y, uR = C.g - 0.5 * sR.y;
   float vL = B.b + 0.5 * sL.z, vR = C.b - 0.5 * sR.z;
-  // 非线性总水深 h=H+η;干床(h<uHMin)界面通量置零(与 cpuSolver.fluxY 同构)
+  // 非线性总水深 h=H+η;干床(h<uHMin)界面改用静水重构保正通量(与 cpuSolver.fluxY 同构)
   float hL = HB + eL, hR = HC + eR;
-  if (hL < uHMin || hR < uHMin) return vec3(0.0);
+  if (hL < uHMin || hR < uHMin) {
+    return vec4(frontFluxY(cellIdx(q.x, q.y), cellIdx(q.x, q.y + 1)), 1.0);
+  }
   float s = sqrt(uG * max(hL, hR));
-  return vec3(
+  return vec4(
     0.5 * (vL + vR) - 0.5 * s * (eR - eL),
     -0.5 * s * (uR - uL),
-    0.5 * uG * (hL * eL + hR * eR) - 0.5 * s * (vR - vL));
+    0.5 * uG * (hL * eL + hR * eR) - 0.5 * s * (vR - vL),
+    0.0);
 }
 
 // ---------------- 可选频率频散(Madsen–Sørensen/Peregrine,与 cpuSolver.computeL 频散源同构) ----------------
@@ -235,7 +298,6 @@ void main() {
 
   float bed = texture2D(uBathymetry, uv).r;
   float H = max(-bed, 0.0);
-  float wet = step(uHMin, H);   // 1 = 水域(静水深 ≥ hMin),0 = 永久陆地
 
   // 缩减纬网:高纬经向每 k 列合并(stride-k 采样),dxEff=k·uDx·cosφ 保持有限;
   // 去除旧 cflFloor hack → 极地波速恢复正确(与 CPU kLat/dxEff、LF 着色器同构)
@@ -252,24 +314,33 @@ void main() {
 
   // 单元 p 的四界面通量:musclFluxX(q,k)=界面 q.x 与 q.x+k 之间(stride-k),
   // musclFluxY(q)=界面 q.y+1/2(stride-1)。故单元 p 的左/右界面用 q=(p.x-k,p.y)/(p.x,p.y)。
-  vec3 fxm = musclFluxX(ivec2(p.x - k, p.y), k);
-  vec3 fxp = musclFluxX(ivec2(p.x,     p.y), k);
-  vec3 fym = musclFluxY(ivec2(p.x, p.y - 1));
-  vec3 fyp = musclFluxY(ivec2(p.x, p.y));
+  // 返回 vec4 第 4 分量 = 是否干湿前沿(源项跳过用,与 cpuSolver 计算同构)
+  vec4 fxm4 = musclFluxX(ivec2(p.x - k, p.y), k);
+  vec4 fxp4 = musclFluxX(ivec2(p.x,     p.y), k);
+  vec4 fym4 = musclFluxY(ivec2(p.x, p.y - 1));
+  vec4 fyp4 = musclFluxY(ivec2(p.x, p.y));
+  vec3 fxm = fxm4.rgb, fxp = fxp4.rgb, fym = fym4.rgb, fyp = fyp4.rgb;
   vec3 L = -vec3(
     (fxp.x - fxm.x) / dxEff + (fyp.x - fym.x) / uDy,
     (fxp.y - fxm.y) / dxEff + (fyp.y - fym.y) / uDy,
     (fxp.z - fxm.z) / dxEff + (fyp.z - fym.z) / uDy);
 
   // 井平衡源项 g·η·∂h/∂x(h=H+η):抵消 g·h·η 通量多出的地形项,使动量方程
-  // 精确回到 -g·h·∂η/∂x;η=0 时源项为 0 → 严格静水平衡(经向用 ±k 邻居,与 stride 一致)
+  // 精确回到 -g·h·∂η/∂x;η=0 时源项为 0 → 严格静水平衡(经向用 ±k 邻居,与 stride 一致)。
+  // 前沿方向跳过:前沿压力作用在截断柱 h* 上,与未截断 h 的源项配对会双重计入
+  // 岸线地形差(伪源 ~g·η·Δh/(2dx),与 cpuSolver 的跳过分支同构)
   float etaC = texture2D(uState, uv).r;
   float hIp = cellDepth(cellIdx(p.x + k, p.y)) + cellState(cellIdx(p.x + k, p.y)).r;
   float hIm = cellDepth(cellIdx(p.x - k, p.y)) + cellState(cellIdx(p.x - k, p.y)).r;
   float hJp = cellDepth(cellIdx(p.x, p.y + 1)) + cellState(cellIdx(p.x, p.y + 1)).r;
   float hJm = cellDepth(cellIdx(p.x, p.y - 1)) + cellState(cellIdx(p.x, p.y - 1)).r;
-  L.y += uG * etaC * (hIp - hIm) / (2.0 * dxEff);
-  L.z += uG * etaC * (hJp - hJm) / (2.0 * uDy);
+  bool wetC = H + etaC >= uHMin;
+  if (!(wetC && (fxm4.w > 0.5 || fxp4.w > 0.5))) {
+    L.y += uG * etaC * (hIp - hIm) / (2.0 * dxEff);
+  }
+  if (!(wetC && (fym4.w > 0.5 || fyp4.w > 0.5))) {
+    L.z += uG * etaC * (hJp - hJm) / (2.0 * uDy);
+  }
 
   // 可选频率频散(与 cpuSolver.computeL 频散源同构):S = coef·∇(∇·(−g·h·∇η)),
   // coef = min(h²/3, 0.6·min(dxEff,dy)²) —— 网格稳定上限(b = coef·k² ≤ 1
@@ -320,10 +391,15 @@ void main() {
     float cf = uDt * uG * uManning * uManning * speed / pow(h, 4.0 / 3.0);
     outState.g /= 1.0 + cf;
     outState.b /= 1.0 + cf;
-    // 永久陆地(H < hMin):动量清零、η 冻结(干界面通量已置零 → 质量守恒)
-    outState.g *= wet;
-    outState.b *= wet;
-    outState.r = mix(U0.r, outState.r, wet);
+    // 动态干湿(取代旧静态陆地冻结,与 cpuSolver.stepV2 同构):步末 h = H+η
+    // 决定干湿 —— 潮间/浅水(H > hMin)保留 hMin 薄膜防负水深;陆地归干(η=0),
+    // 等前沿通量把水送上来再自然变湿(run-up)
+    float hEnd = H + outState.r;
+    if (hEnd < uHMin) {
+      outState.r = H > uHMin ? uHMin - H : 0.0;
+      outState.g = 0.0;
+      outState.b = 0.0;
+    }
     // 辐射边界(特征投影,仅 plane):边界单元投影到出射特征、令入射特征为零,
     // 让出海波透射、反射压到 <2%(与 cpuSolver.stepV2 辐射 pass 同构;globe 经向周期无需)
     if (uGlobeMode < 0.5) {
@@ -371,6 +447,22 @@ void main() {
   float rr = uSource.z * uSource.z;
   c.r += uSourceAmp * exp(-dot(dv, dv) / rr);
   gl_FragColor = c;
+}
+`;
+
+/** 累计最大水深(run-up 统计,每子步 max-pool;与 CpuSolver.maxH 同构)。
+ * 读当前状态 + 上一帧 run-up,写 max(prev, h);新事件由 JS 侧清零。 */
+export const RUNUP_FRAG = /* glsl */ `
+uniform sampler2D uState;
+uniform sampler2D uRunup;
+uniform sampler2D uBathymetry;
+uniform vec2 uRes;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float h = max(max(-texture2D(uBathymetry, uv).r, 0.0) + texture2D(uState, uv).r, 0.0);
+  float prev = texture2D(uRunup, uv).r;
+  gl_FragColor = vec4(max(prev, h), 0.0, 0.0, 1.0);
 }
 `;
 
@@ -526,8 +618,12 @@ void main() {
 }
 `;
 
-/** 地形片元着色器:按高程着色(深海墨蓝 → 浅海青 → 陆地绿棕) */
+/** 地形片元着色器:按高程着色(深海墨蓝 → 浅海青 → 陆地绿棕);
+ * 叠加累计淹没图层(上过水的陆地按最大淹没深度橙黄渐变) */
 export const TERRAIN_FRAG = /* glsl */ `
+uniform sampler2D uRunup;   // 累计最大水深(求解网格,新事件清零)
+uniform float uRunupOn;     // 1 = 显示淹没范围图层
+
 varying float vBed;
 varying vec3  vNormal;
 varying vec2  vUv;
@@ -542,6 +638,15 @@ void main() {
   } else {
     float h = clamp(vBed / 180.0, 0.0, 1.0);
     col = mix(vec3(0.24, 0.42, 0.24), vec3(0.52, 0.45, 0.34), h);
+  }
+
+  // 淹没范围图层:曾被动淹没的陆地(bed ≥ 0 且累计水深 > 5 mm)按深度橙黄渐变
+  if (uRunupOn > 0.5 && vBed > -0.001) {
+    float flood = texture2D(uRunup, vUv).r;
+    if (flood > 0.005) {
+      vec3 fcol = mix(vec3(0.95, 0.32, 0.08), vec3(0.99, 0.85, 0.30), clamp(flood / 5.0, 0.0, 1.0));
+      col = mix(col, fcol, 0.72);
+    }
   }
 
   float diff = clamp(dot(normalize(vNormal), normalize(vec3(0.4, 0.6, 0.8))), 0.0, 1.0);
