@@ -121,6 +121,16 @@ export class TsunamiApp {
         this.quakeAt(u, v);
       },
       onTohokuQuake: () => {
+        // 球面模式:改用 2011 真实断层场(Okada 双极源 ~200 km,网格可解析);
+        // 点高斯预设半径 18 km < 39 km 格距是亚格源,数分钟内弥散殆尽
+        if (this.viewMode === 'globe') {
+          const q = findQuake('tohoku2011');
+          if (q) {
+            void this.triggerCatalogQuake(q);
+            return;
+          }
+        }
+        // 平面模式:点高斯(网格 ~1 km,18 km 半径可解析)
         // 2011 东北海域地震震中(约 142.9E, 38.1N)
         this.panel.params.magnitude = 9.0;
         this.panel.refreshMagnitude();
@@ -141,6 +151,8 @@ export class TsunamiApp {
         this.solver.uniforms.uRunupOn.value = v ? 1 : 0;
         this.sceneApp.setInundationVisible(v);
       },
+      onContoursVisible: (v) => this.sceneApp.setContourVisible(v),
+      onSiteLabelsVisible: (v) => this.sceneApp.setSiteLabelsVisible(v),
       onWireframe: (v) => this.sceneApp.setWireframe(v),
       onLoadTohoku: () => this.loadTohoku(),
       onLoadGlobe: () => this.loadGlobe(),
@@ -153,6 +165,11 @@ export class TsunamiApp {
       onGeoSubmit: () => this.geoSubmit(),
       onGeoNextFrame: () => this.geoNextFrame(),
     });
+    // 初始同步显示开关(淹没图层/等值线默认开,构造时 uniform/材质未带面板状态)
+    this.solver.uniforms.uRunupOn.value = this.panel.params.showInundation ? 1 : 0;
+    this.sceneApp.setInundationVisible(this.panel.params.showInundation);
+    this.sceneApp.setContourVisible(this.panel.params.showContours);
+    this.sceneApp.setSiteLabelsVisible(this.panel.params.showSiteLabels);
     this.setRegionText(`程序化理想地形 ${DOMAIN_KM}×${DOMAIN_KM} km`);
 
     // --- 点击海面触发地震(区分点击与拖拽) ---
@@ -614,6 +631,10 @@ export class TsunamiApp {
   }
 
   private updateObserverRows(): void {
+    this.sceneApp.updateSiteLabels(
+      this.observers.map((o) => o.site.name),
+      this.observers.map((o) => o.peak)
+    );
     for (let k = 0; k < this.observers.length; k++) {
       const o = this.observers[k];
       const row = this.observerRows[k];

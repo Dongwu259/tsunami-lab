@@ -1,9 +1,10 @@
 /**
  * 全部 GLSL 着色器。
  *
- * 物理模型:线性浅水方程(Linear Shallow Water Equations)
- *   ∂η/∂t  = -∇·(H·u)            连续性方程
- *   ∂(H·u)/∂t = -g·H·∇η          动量方程
+ * 物理模型:非线性浅水方程(教学级弱非线性:总水深 h = H + η,略去 (u·∇)u 对流项)
+ *   ∂η/∂t     = -∇·(h·u)                    连续性方程
+ *   ∂(h·u)/∂t = -g·h·∇η - g·η·∇h + 底摩擦    动量方程(井平衡源,静水平衡严格)
+ * 可选:Madsen–Sørensen 型频率频散源项;干湿界面静水重构 run-up(ROADMAP 阶段 4/5)。
  * 状态纹理:r = η(海面位移 m),g = Hu,b = Hv(深度积分通量 m²/s)。
  * 数值格式(uScheme 切换):
  *   0 = 一阶 Lax–Friedrichs(教学对照,耗散大);
@@ -551,7 +552,23 @@ vec3 seismicOverlay(vec3 col, vec2 suv) {
 }
 `;
 
-/** 海面片元着色器:按波高着色(波谷深蓝 → 平静青蓝 → 波峰红橙) */
+/** 浪高等值线叠加代码段:|η| ∈ {0.5,1,2,5,10} m 的细暗线(绝对浪高标注,
+ * 不随色标量程缩放);无导数扩展,线宽按标高比例近似。 */
+const CONTOUR_GLSL = /* glsl */ `
+uniform float uContourOn;    // 1 = 显示浪高等值线
+
+float contourLine(float a) {
+  float l = 0.0;
+  l = max(l, 1.0 - clamp(abs(a - 0.5) / (0.045 * 0.5 + 0.004), 0.0, 1.0));
+  l = max(l, 1.0 - clamp(abs(a - 1.0) / (0.045 * 1.0 + 0.004), 0.0, 1.0));
+  l = max(l, 1.0 - clamp(abs(a - 2.0) / (0.045 * 2.0 + 0.004), 0.0, 1.0));
+  l = max(l, 1.0 - clamp(abs(a - 5.0) / (0.045 * 5.0 + 0.004), 0.0, 1.0));
+  l = max(l, 1.0 - clamp(abs(a - 10.0) / (0.045 * 10.0 + 0.004), 0.0, 1.0));
+  return l;
+}
+`;
+
+/** 海面片元着色器:按波高着色(波谷深蓝 → 平静青蓝 → 波峰红橙)+ 浪高等值线 */
 export const WATER_FRAG = /* glsl */ `
 uniform float uColorScale;   // 1 / 色标半量程(m)
 uniform float uOpacity;      // 海面不透明度(0–1),调低可透视海底地形
@@ -560,6 +577,7 @@ varying vec2  vUv;
 varying float vEta;
 varying vec3  vNormal;
 
+${CONTOUR_GLSL}
 ${SEISMIC_GLSL}
 
 vec3 colormap(float t) {
@@ -576,6 +594,11 @@ void main() {
 
   float diff = clamp(dot(normalize(vNormal), normalize(vec3(0.4, 0.6, 0.8))), 0.0, 1.0);
   col *= 0.55 + 0.55 * diff;
+
+  // 浪高等值线(绝对米制标高,叠加在色标之上)
+  if (uContourOn > 0.5) {
+    col = mix(col, vec3(0.05, 0.08, 0.10), contourLine(abs(vEta)) * 0.85);
+  }
 
   col = seismicOverlay(col, vUv);
 

@@ -155,6 +155,7 @@ function smokeRenderShaders(renderer: THREE.WebGLRenderer): void {
           uColorScale: { value: 0.5 },
           uOpacity: { value: 0.8 },
           uRunup: { value: null },
+          uContourOn: { value: 1 },
           uRunupOn: { value: 1 },
           uSeisOn: { value: 0 },
           uSeisT: { value: 0 },

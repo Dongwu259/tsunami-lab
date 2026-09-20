@@ -41,6 +41,14 @@ export class SceneApp {
   private waterOpacity = 0.8;
   /** 淹没范围图层开关(跨模式保留用户设置) */
   private inundationOn = false;
+  /** 浪高等值线开关(跨模式保留用户设置) */
+  private contourOn = true;
+  /** 站点浪高标注开关 */
+  private siteLabelsOn = true;
+  /** 站点浪高标注覆盖层(HTML)与标签元素 */
+  private labelLayer: HTMLDivElement;
+  private siteLabels: HTMLDivElement[] = [];
+  private siteWorldPos: THREE.Vector3[] = [];
 
   /** 渲染网格分辨率(可高于求解网格,仅影响地形/海面细节)
    *  null = 跟随求解网格 */
@@ -148,6 +156,13 @@ export class SceneApp {
     this.scene.add(this.observerGroup);
     this.scene.add(this.epicenterGroup);
 
+    // 站点浪高标注覆盖层(与画布同尺寸,pointer-events 穿透)
+    if (getComputedStyle(container).position === 'static') container.style.position = 'relative';
+    this.labelLayer = document.createElement('div');
+    this.labelLayer.style.cssText =
+      'position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:4;';
+    container.appendChild(this.labelLayer);
+
     this.initSize(container);
     window.addEventListener('resize', this.onResize);
   }
@@ -219,6 +234,7 @@ export class SceneApp {
           uWaveScale: { value: 0.5 },
           uColorScale: { value: 0.5 },
           uOpacity: { value: this.waterOpacity },
+          uContourOn: { value: this.contourOn ? 1 : 0 },
           ...this.seisUniforms(true),
         },
         transparent: true,
@@ -251,6 +267,7 @@ export class SceneApp {
           uDomainKm: { value: this.domainKm },
           uColorScale: { value: 0.5 },
           uOpacity: { value: this.waterOpacity },
+          uContourOn: { value: this.contourOn ? 1 : 0 },
           ...this.seisUniforms(false),
         },
         transparent: true,
@@ -397,6 +414,29 @@ export class SceneApp {
     this.terrainMat.uniforms.uRunupOn.value = on ? 1 : 0;
   }
 
+  /** 浪高等值线开关 */
+  setContourVisible(on: boolean): void {
+    this.contourOn = on;
+    this.waterMat.uniforms.uContourOn.value = on ? 1 : 0;
+  }
+
+  /** 站点浪高标注开关 */
+  setSiteLabelsVisible(on: boolean): void {
+    this.siteLabelsOn = on;
+    this.labelLayer.style.display = on ? '' : 'none';
+  }
+
+  /** 更新站点浪高标注文本(peaks 与 setObserverMarkers 的站点一一对应) */
+  updateSiteLabels(names: string[], peaks: number[]): void {
+    for (let k = 0; k < this.siteLabels.length; k++) {
+      const label = this.siteLabels[k];
+      if (!label) continue;
+      const pk = peaks[k] ?? 0;
+      label.textContent = `${names[k] ?? ''} ${pk < 0.005 ? '--' : pk.toFixed(2) + ' m'}`;
+      label.style.borderColor = pk >= 0.05 ? 'rgba(255,120,60,0.9)' : 'rgba(255,215,120,0.55)';
+    }
+  }
+
   /** 设置垂直夸张系数(同时作用于波形与地形,按模式取不同基准) */
   setExaggeration(ex: number): void {
     if (this.mode === 'globe') {
@@ -428,11 +468,14 @@ export class SceneApp {
     this.terrainMat.wireframe = on;
   }
 
-  /** 更新观测点标记(uv 为求解域坐标;空列表清空) */
+  /** 更新观测点标记(uv 为求解域坐标;空列表清空)与浪高标注标签 */
   setObserverMarkers(uvs: { u: number; v: number }[]): void {
     this.observerGroup.clear();
     this.observerGeo?.dispose();
     this.observerGeo = null;
+    this.labelLayer.replaceChildren();
+    this.siteLabels = [];
+    this.siteWorldPos = [];
     if (uvs.length === 0) return;
 
     if (this.mode === 'globe') {
@@ -450,6 +493,7 @@ export class SceneApp {
         m.position.copy(dir).multiplyScalar(R);
         m.quaternion.setFromUnitVectors(up, dir);
         this.observerGroup.add(m);
+        this.pushSiteLabel(dir.clone().multiplyScalar(R * 1.03));
       }
     } else {
       // 平面域:标记尺寸随域尺度缩放,悬于海面上方
@@ -461,8 +505,21 @@ export class SceneApp {
         // 平面网格绕 x 轴旋平后:局部 (x, y) → 世界 (x, 0, -y)
         m.position.set((u - 0.5) * this.domainKm.x, s * 0.8, (0.5 - v) * this.domainKm.y);
         this.observerGroup.add(m);
+        this.pushSiteLabel(new THREE.Vector3((u - 0.5) * this.domainKm.x, s * 1.6, (0.5 - v) * this.domainKm.y));
       }
     }
+  }
+
+  /** 新建一个站点浪高标注 div 并记录其世界坐标(每帧投影到屏幕) */
+  private pushSiteLabel(worldPos: THREE.Vector3): void {
+    const el = document.createElement('div');
+    el.style.cssText =
+      'position:absolute;transform:translate(-50%,-100%);white-space:nowrap;' +
+      'font:11px/1.4 ui-monospace,monospace;color:#ffe9c9;background:rgba(20,28,40,0.72);' +
+      'border:1px solid rgba(255,215,120,0.55);border-radius:4px;padding:1px 5px;';
+    this.labelLayer.appendChild(el);
+    this.siteLabels.push(el);
+    this.siteWorldPos.push(worldPos);
   }
 
   /** uv → 球面单位方向向量(与 SphereGeometry 参数化一致) */
@@ -571,6 +628,17 @@ export class SceneApp {
     }
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
+    // 站点浪高标注投影到屏幕
+    const w = this.renderer.domElement.clientWidth;
+    const h = this.renderer.domElement.clientHeight;
+    for (let k = 0; k < this.siteLabels.length; k++) {
+      const p = this.siteWorldPos[k].clone().project(this.camera);
+      const el = this.siteLabels[k];
+      if (p.z > 1 || p.z < -1) { el.style.display = 'none'; continue; }
+      el.style.display = '';
+      el.style.left = `${((p.x + 1) / 2) * w}px`;
+      el.style.top = `${((1 - p.y) / 2) * h}px`;
+    }
   }
 
   dispose(): void {
