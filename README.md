@@ -27,10 +27,14 @@
 ```bash
 npm install
 npm run dev      # 开发模式
+npm run check    # 类型检查(tsc --noEmit)
+npm test         # 单元测试 + 数值基准(vitest;CI 无 WebGL 也能跑)
 npm run build    # 类型检查 + 生产构建
 ```
 
 任意现代浏览器(Chrome / Edge / Safari / Firefox,macOS / Windows / Linux)打开即可使用。
+
+> 👩‍💻 **参与开发 / 接手项目**:先读 [CONTRIBUTING.md](CONTRIBUTING.md)(环境与命令、**CPU↔GPU 求解器镜像不变量**、测试与验证体系、提交/发布规范、已知陷阱清单);数值格式的分阶段升级计划与验收标准见 [ROADMAP.md](ROADMAP.md)。
 
 ## 技术选型与开源协议调研
 
@@ -49,7 +53,8 @@ npm run build    # 类型检查 + 生产构建
 
 ```
 index.html / src/main.ts        入口与 HUD 界面
-src/config.ts                   全局仿真参数(网格、域尺度、时间步)
+src/config.ts                   全局仿真参数(网格、域尺度、时间步)+ 数值辅助(dt/极地 stride)
+src/debug-gpu.ts                DEV:GPU↔CPU 64² 逐步一致性对比(经 debug.html 运行,不进 CI)
 src/simulation/
   bathymetry.ts                 程序化理想海床地形(深海沟 + 海山 + 海岸)
   RealBathymetry.ts             .tsunami 二进制解析 + 经纬度域→仿真网格重采样
@@ -109,6 +114,10 @@ data/globe.tsunami              随包全球地形(±84°,2048×1024 等距圆�
 > **验证**:上述格式的 CPU/TS 镜像([`src/simulation/cpuSolver.ts`](src/simulation/cpuSolver.ts),与 GLSL 逐式同构)
 > 由 [`src/simulation/benchmarks.test.ts`](src/simulation/benchmarks.test.ts) 在 CI 无 WebGL 环境下覆盖:
 > 行波衰减、二阶收敛阶、静水平衡、质量守恒、Green 定律浅水放大、辐射边界反射、缩减纬网极地波速、球面长时稳定性。
+>
+> ⚠️ **改求解器数值必须同步 CPU 与 GPU 两份实现**([`cpuSolver.ts`](src/simulation/cpuSolver.ts) ↔ [`shaders.ts`](src/simulation/shaders.ts) 的 `STEP_FRAG`/`STEP_FRAG_V2`):
+> CI 无 WebGL、只跑 CPU 镜像,只改一侧会让 CI「假绿」而实际渲染行为与通过的测试背离。
+> 标准流程与 GPU↔CPU 对比工具(`/debug.html`)见 [CONTRIBUTING.md §3](CONTRIBUTING.md)。
 
 ### 真实地震(历史目录)
 
@@ -250,6 +259,8 @@ Web 端“科研模式 (GeoClaw)”面板:测试连接 → 设置时长/帧数 �
 
 ## 路线图
 
+> 数值求解器的**分阶段升级计划(阶段 1–6)与量化验收标准**见 [ROADMAP.md](ROADMAP.md)。
+
 - [x] 导入真实地形(GEBCO / ETOPO / 高程瓦片 → `.tsunami` → 海床纹理)
 - [x] 接入 GeoClaw 作为高精度后端(任务提交 + 结果帧回放)
 - [x] 3D 全球地球模式(全球地形 + 球面求解 + 跨洋传播)
@@ -258,7 +269,9 @@ Web 端“科研模式 (GeoClaw)”面板:测试连接 → 设置时长/帧数 �
 - [x] 地震体波可视化(P/S 波圈)
 - [x] 非线性浅水(总水深 + 井平衡源 + 曼宁摩擦)+ 二阶 MUSCL-RK2 低耗散格式
 - [x] 辐射边界(特征投影)+ 缩减纬网极地处理(CPU 镜像 + 数值基准入 CI)
-- [ ] 完全非线性对流项 + 真实动边界淹没(run-up 统计)
+- [ ] 可选频散(Boussinesq,Madsen–Sørensen 型):近场/港湾短波(ROADMAP 阶段 4)
+- [ ] 完全非线性对流项 + 真实动边界淹没(run-up 统计 + 淹没图层)(ROADMAP 阶段 5)
+- [ ] WebGPU compute 迁移(WebGL2 保留为 fallback,MAX_GRID 384→1024)(ROADMAP 阶段 6)
 - [ ] GeoClaw 结果实时流式回放(边算边看)
 - [ ] 潮位站时间序列曲线(验潮记录仪风格)
 - [ ] 多语言 UI
