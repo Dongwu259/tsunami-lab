@@ -59,8 +59,9 @@ src/config.ts         全局仿真参数 + 数值辅助(computeStableDt/polarStr
 | `inject(u,v,amp,r)` | `INJECT_FRAG` | 高斯型海底抬升震源 |
 | 薄海绵 `thinSpongeFactor` + 辐射 pass(特征投影) | `thinSponge()` + V2 特征投影辐射 BC | 平面域边界处理 |
 | `kLat` / `dxEff=k·dx·cosφ`(缩减纬网) | V2/LF 的 `int k` / `dxEff` | 极地 stride-k 合并 |
+| `computeL` 频散源(`vxAt/vyAt/divAt`) | V2 的 `dispVx/dispVy/dispDiv`(`uDispersion>0.5`) | 可选频率频散(η 位势形式源项,coef=min(h²/3, 0.6·min(dx,dy)²)) |
 
-- **uniform 语义一致**:`uDx/uDy/uDt/uG/uHMin/uManning/uGlobeMode/uStage/u0/uDiag`(LF 另有 `uDamping`)。`uScheme` 是 JS 侧控制量(`>0.5` 绑定 V2 程序,否则 LF),运行时可切换。
+- **uniform 语义一致**:`uDx/uDy/uDt/uG/uHMin/uManning/uGlobeMode/uDispersion/uStage/u0/uDiag`(LF 另有 `uDamping`)。`uScheme` 是 JS 侧控制量(`>0.5` 绑定 V2 程序,否则 LF),运行时可切换。
 - **为什么这条不变量是硬性的**:CI 环境**无 WebGL**,只能运行 `cpuSolver` 镜像(`benchmarks.test.ts`)。若只改 GLSL 而不改 CPU 镜像,**CI 仍会全绿,但实际 GPU 渲染行为可能与"通过的测试"背离** —— 测试将不再代表真实求解器。
 
 ### 改求解器的标准流程(checklist)
@@ -146,6 +147,7 @@ git -c user.name="Dongwu259" -c user.email="Dongwu259@users.noreply.github.com" 
 - **极地波速测量的剪切耦合伪影**:球面上不同纬度列速 `c/(dx·cosφ)` 不同,y 耦合会把极侧更快东移的 η 喂入目标行,使质心东偏 → **长时间测速偏快(误差 ∝ T)**。量测时用 **y-均匀注入(初始无 y 梯度)+ 早期窗口**;赤道无剪切,可验证格式内禀波速(误差应 ≈0)。
 - **球面 CFL 是二维的**:稳定条件 `νx+νy ≤ 1`(非单向 `ν≤1`)。去掉旧 `cflFloor` hack 后,globe 的 `dt` 必须用**缩减后最小经向格距** `dxM·reducedGridMinFactor(GLOBE_LAT_SPAN, sizeY)` 计算,否则高纬模式缓慢累积、数十分钟后**延迟爆炸**(峰值波高显示天文数字是最直接信号)。
 - **GLSL ES 1.00 限制**:无 `int` 版 `min`/`max`(`genIType` 是 ES 3.00),整数取小/大用三元 `a<b?a:b`;支持 int 算术、三元、`float(k)` 转换。
+- **显式 Boussinesq 频散的稳定性**(阶段4):频散系数必须带**网格上限** `coef = min(h²/3, 0.6·min(dxEff,dy)²)`——显式处理的稳定条件 `b = coef·k² ≤ 1` 要对一切网格模式成立。试过并否决的方案:半隐式 Δq 修正(慢驻波寄生)、滞后 L⁰ 修正(共振爆炸)、逐点比值限制器 `|S|≤0.9|L|`(|L| 过零处削顶 → 谐波级联耗散)。改动频散项须重跑阶段4 三基准。
 
 **工程 / 发布**
 - **push 403「Write access to repository not granted」**:git 走了系统 `osxkeychain` 里缓存的**另一身份**(它先于临时 helper 被尝试)。用**内联重置** helper 列表再挂 gh,使 gh 成为唯一凭据源(勿持久化改配置):

@@ -112,6 +112,9 @@ export class TsunamiApp {
       onManningChange: (n) => {
         this.solver.uniforms.uManning.value = n;
       },
+      onDispersionChange: (on) => {
+        this.solver.uniforms.uDispersion.value = on ? 1 : 0;
+      },
       onRandomQuake: () => {
         const u = 0.12 + Math.random() * 0.34;
         const v = 0.12 + Math.random() * 0.76;
@@ -202,6 +205,8 @@ export class TsunamiApp {
     this.solver.uniforms.uScheme.value =
       this.panel.params.scheme === 'lf' ? 0 : 1;
     this.solver.uniforms.uManning.value = this.panel.params.manning;
+    this.solver.uniforms.uDispersion.value =
+      this.panel.params.dispersion ? 1 : 0;
     // 高分辨率渲染纹理:RGBA 浮点(r = 高程),与求解器 bathyTexture 格式一致;
     // 旧纹理由 setRenderBathy 内部统一 dispose
     if (renderSize && hiResGrid) {

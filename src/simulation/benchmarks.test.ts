@@ -282,3 +282,142 @@ describe('阶段3:缩减纬网极地波速', () => {
     expect(polarSpeedErr(74)).toBeLessThan(0.03);  // 实测 ≈1%(k=2 stride 采样,早期窗口)
   }, 60000);
 });
+
+/**
+ * 阶段4:可选频率频散(Madsen–Sørensen/Peregrine 型混合导数项)。
+ * 原计划验收为「孤立波 L2」;本模型按设计略去水平对流项,不存在孤立波孤立子解
+ * (非线性陡化与频散无法平衡),该项不适定 → 改测色散关系本身(见 ROADMAP 偏差记录)。
+ * 实现为 η 位势形式源项 S = coef·∇(∇·(−g·h·∇η)),阶段一致显式,
+ * coef = min(h²/3, 0.6·min(dx,dy)²)(网格稳定上限)→ 色散曲线 ω² = c²k²(1 − coef·k²)。
+ * 测法:周期域单色右行波,右行特征 R=(η+hu/c)/2 的 DFT 模式相位随时间的推进速率
+ * (隔离初始暂态在 η 场上的双向波拍频);关频散对照应回到无色散 ω = ck。
+ */
+describe('阶段4:频率频散(色散关系与波包扩展)', () => {
+  /** 单色右行波演化 steps 步,返回右行模式测得的 ω 与相对初始的振幅保持率 */
+  function measureOmega(dispersion: boolean, steps: number): { omega: number; ampKeep: number } {
+    const mu = 0.8;                          // kh:频散显著且可解析
+    const k = mu / H0;
+    const lam = (2 * Math.PI) / k;
+    const nx = 16;                           // 一波长 16 点 → coef 网格上限生效(教学网格典型)
+    const dx = lam / nx;
+    const dt = 0.5 * (dx / C0);
+    const s = new CpuSolver({
+      nx, ny: 2, dx, dy: dx, bed: new Float64Array(nx * 2).fill(-H0),
+      dt, scheme: 'v2', spongeWidth: 0, periodicX: true, manning: 0, dispersion,
+    });
+    const coef = Math.min((H0 * H0) / 3, 0.6 * dx * dx);
+    const omegaAna = C0 * k * Math.sqrt(1 - coef * k * k);   // 实现系统的解析色散曲线
+    const amp = 0.01;
+    for (let j = 0; j < 2; j++)
+      for (let i = 0; i < nx; i++) {
+        const e = amp * Math.cos(k * (i + 0.5) * dx);
+        s.eta[j * nx + i] = e;
+        s.hu[j * nx + i] = omegaAna / k * e;   // 右行特征速度按频散相速给(收敛最快)
+      }
+    const modeR = (): { th: number; re: number; im: number } => {
+      let re = 0, im = 0;
+      for (let i = 0; i < nx; i++) {
+        const r = 0.5 * (s.eta[i] + s.hu[i] / C0);
+        const ph = k * (i + 0.5) * dx;
+        re += r * Math.cos(ph);
+        im -= r * Math.sin(ph);
+      }
+      return { th: Math.atan2(im, re), re, im };
+    };
+    const m0 = modeR();
+    const a0 = Math.hypot(m0.re, m0.im);
+    let thPrev = m0.th;
+    let dSum = 0;
+    for (let n = 0; n < steps; n++) {
+      s.step();
+      const m = modeR();
+      let d = m.th - thPrev;
+      if (d > Math.PI) d -= 2 * Math.PI;
+      if (d < -Math.PI) d += 2 * Math.PI;
+      dSum += d;
+      thPrev = m.th;
+    }
+    const m1 = modeR();
+    return { omega: -dSum / steps / dt, ampKeep: Math.hypot(m1.re, m1.im) / a0 };
+  }
+
+  it('μ=kh=0.8 相速符合实现系统色散曲线 ±2.5%,关频散对照偏离 >3.5%', () => {
+    const mu = 0.8;
+    const k = mu / H0;
+    const lam = (2 * Math.PI) / k;
+    const dx = lam / 16;
+    const coef = Math.min((H0 * H0) / 3, 0.6 * dx * dx);
+    const omegaAna = C0 * k * Math.sqrt(1 - coef * k * k);
+    const on = measureOmega(true, 100);
+    const off = measureOmega(false, 100);
+    const errOn = Math.abs(on.omega - omegaAna) / omegaAna;
+    const errOff = Math.abs(off.omega - omegaAna) / omegaAna;
+    expect(errOn).toBeLessThan(0.025);    // 开频散:落在解析色散曲线上(实测 ≈1.4%)
+    expect(errOff).toBeGreaterThan(0.035); // 关频散:回到无色散 ω=ck(慢 ≈5%)
+    expect(on.ampKeep).toBeGreaterThan(0.02); // 16pts 粗网格基格式耗散大,只查非零
+  }, 60000);
+
+  it('高斯波包:开频散产生物理频散扩展(RMS 宽度 >1.1×),质量守恒不变', () => {
+    const spreadOf = (dispersion: boolean): { sigma: number; massErr: number } => {
+      // h≈dx 的近场网格(coef 上限部分生效),短波包主导模 μ≈0.6 → 可测频散扩展
+      const H1 = 100, nx = 400, L = 24000, dx = L / nx;
+      const s = new CpuSolver({
+        nx, ny: 2, dx, dy: dx, bed: new Float64Array(nx * 2).fill(-H1),
+        dt: 0.5 * (dx / Math.sqrt(GRAVITY * H1)), scheme: 'v2', spongeWidth: 0,
+        periodicX: true, manning: 0, dispersion,
+      });
+      const x0 = L / 4, w = 80;
+      const c1 = Math.sqrt(GRAVITY * H1);
+      for (let j = 0; j < 2; j++)
+        for (let i = 0; i < nx; i++) {
+          const e = Math.exp(-((((i + 0.5) * dx - x0) / w) ** 2));
+          s.eta[j * nx + i] = e;
+          s.hu[j * nx + i] = c1 * e;      // 纯右行包(避免双向分裂污染宽度度量)
+        }
+      const v0 = s.totalVolume();
+      const sigma = (): number => {
+        let sw = 0, sx = 0, sxx = 0;
+        for (let i = 0; i < nx; i++) {
+          const a = Math.abs(s.eta[i]), x = (i + 0.5) * dx;
+          sw += a; sx += a * x; sxx += a * x * x;
+        }
+        return Math.sqrt(sxx / sw - (sx / sw) ** 2);
+      };
+      const T = 120;                       // 波包约走 3.8 km ≈ 47 倍初始宽度
+      const steps = Math.round(T / s.dt);
+      for (let n = 0; n < steps; n++) s.step();
+      return {
+        sigma: sigma(),
+        massErr: Math.abs(s.totalVolume() - v0) / v0,
+      };
+    };
+    const on = spreadOf(true);
+    const off = spreadOf(false);
+    expect(on.sigma).toBeGreaterThan(off.sigma * 1.1);   // 频散尾波展宽(实测区分明显)
+    expect(on.massErr).toBeLessThan(1e-6);              // 频散项只动量、不触碰质量
+    expect(off.massErr).toBeLessThan(1e-6);
+  }, 60000);
+
+  it('变水深 + 频散长时 3000 步稳定无发散(系数网格上限守恒)', () => {
+    const nx = 512, L = 200e3, dx = L / nx;
+    const bed = new Float64Array(nx * 2);
+    for (let j = 0; j < 2; j++)
+      for (let i = 0; i < nx; i++)
+        bed[j * nx + i] = -(1000 - 900 * (i / nx));   // 1000 m → 100 m 缓坡
+    const s = new CpuSolver({
+      nx, ny: 2, dx, dy: dx, bed,
+      dt: computeStableDt(dx, dx, 1000), scheme: 'v2',
+      spongeWidth: 0.06, dispersion: true, manning: 0,
+    });
+    const x0 = 40e3, w = 8e3;
+    for (let j = 0; j < 2; j++)
+      for (let i = 0; i < nx; i++)
+        s.eta[j * nx + i] = Math.exp(-((((i + 0.5) * dx - x0) / w) ** 2));
+    const p0 = s.readPeak();
+    for (let n = 0; n < 3000; n++) s.step();
+    const p = s.readPeak();
+    expect(Number.isFinite(p)).toBe(true);
+    expect(p).toBeGreaterThan(0);
+    expect(p).toBeLessThan(p0 * 3);
+  }, 60000);
+});

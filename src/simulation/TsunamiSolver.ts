@@ -152,6 +152,7 @@ export class TsunamiSolver {
       uG: { value: GRAVITY },
       uDamping: { value: 0.9998 },   // 仅 LF(legacy)格式使用
       uManning: { value: MANNING_N }, // V2 隐式曼宁摩擦系数 n
+      uDispersion: { value: 0 },      // V2 可选频率频散(0 关;LF 不支持)
       uHMin: { value: H_MIN },        // 干单元阈值(m)
       uGlobeMode: { value: globeMode ? 1 : 0 },
       uScheme: { value: scheme },

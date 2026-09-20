@@ -166,6 +166,48 @@ vec3 musclFluxY(ivec2 q) {
     -0.5 * s * (uR - uL),
     0.5 * uG * (hL * eL + hR * eR) - 0.5 * s * (vR - vL));
 }
+
+// ---------------- 可选频率频散(Madsen–Sørensen/Peregrine,与 cpuSolver.computeL 频散源同构) ----------------
+uniform float uDispersion;   // 1 = 开启频率频散(仅 V2;LF 不支持)
+
+// 指定行的缩减纬网 stride 与有效经向格距(与 main 的逐行 k/dxEff 公式一致)
+int kRow(int j) {
+  if (uGlobeMode < 0.5) return 1;
+  float lat = ((float(j) + 0.5) / uRes.y - 0.5) * 168.0;
+  float a = abs(lat);
+  if (a > 80.0) return 4;
+  if (a > 74.0) return 2;
+  return 1;
+}
+float dxEffRow(int j) {
+  if (uGlobeMode < 0.5) return uDx;
+  int kk = kRow(j);
+  float lat = ((float(j) + 0.5) / uRes.y - 0.5) * 168.0;
+  return float(kk) * uDx * cos(max(abs(lat), 5.0) * 0.017453293);
+}
+float hCell(ivec2 c) { return max(cellDepth(c) + cellState(c).r, 0.0); }
+
+// V = −g·h·∇η(q_t 的 SWE 一阶迭代),x/y 分量(与 CPU vxAt/vyAt 同构)
+float dispVx(int ii, int jj) {
+  int kk = kRow(jj);
+  ivec2 cC = cellIdx(ii, jj);
+  ivec2 cP = cellIdx(ii + kk, jj);
+  ivec2 cM = cellIdx(ii - kk, jj);
+  return (-uG * hCell(cC) * (cellState(cP).r - cellState(cM).r)) / (2.0 * dxEffRow(jj));
+}
+float dispVy(int ii, int jj) {
+  ivec2 cC = cellIdx(ii, jj);
+  ivec2 cP = cellIdx(ii, jj + 1);
+  ivec2 cM = cellIdx(ii, jj - 1);
+  return (-uG * hCell(cC) * (cellState(cP).r - cellState(cM).r)) / (2.0 * uDy);
+}
+// ∇·V(与 CPU divAt 同构;行号经 cellIdx 钳制)
+float dispDiv(int ii, int jj) {
+  int kk = kRow(jj);
+  float dxe = dxEffRow(jj);
+  return (dispVx(ii + kk, jj) - dispVx(ii - kk, jj)) / (2.0 * dxe)
+       + (dispVy(ii, jj + 1) - dispVy(ii, jj - 1)) / (2.0 * uDy);
+}
 `;
 
 /** RK2 推进着色器(uScheme=1)。uStage 切换两个 SSP-RK2 阶段:
@@ -228,6 +270,20 @@ void main() {
   float hJm = cellDepth(cellIdx(p.x, p.y - 1)) + cellState(cellIdx(p.x, p.y - 1)).r;
   L.y += uG * etaC * (hIp - hIm) / (2.0 * dxEff);
   L.z += uG * etaC * (hJp - hJm) / (2.0 * uDy);
+
+  // 可选频率频散(与 cpuSolver.computeL 频散源同构):S = coef·∇(∇·(−g·h·∇η)),
+  // coef = min(h²/3, 0.6·min(dxEff,dy)²) —— 网格稳定上限(b = coef·k² ≤ 1
+  // 对一切网格模式成立);全球网格(h/dx≪1)完整 Peregrine 强度。η=0 ⇒ S=0,
+  // 不破坏静水平衡;只加动量 → 质量守恒不变。
+  if (uDispersion > 0.5) {
+    float hC = max(H + etaC, 0.0);
+    if (hC >= uHMin) {
+      float dMin = dxEff < uDy ? dxEff : uDy;
+      float coef = min(hC * hC / 3.0, 0.6 * dMin * dMin);
+      L.y += coef * (dispDiv(p.x + k, p.y) - dispDiv(p.x - k, p.y)) / (2.0 * dxEff);
+      L.z += coef * (dispDiv(p.x, p.y + 1) - dispDiv(p.x, p.y - 1)) / (2.0 * uDy);
+    }
+  }
 
   if (uDiag > 0.5) {
     // 诊断:r=Lη·1e3, g=Lhu, b=Lhv, a=fxp.y-fxm.y(压力通量差)

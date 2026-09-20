@@ -30,6 +30,8 @@ export interface CpuSolverOptions {
   hMin?: number;
   /** 辐射边界(单向波 η 外推,plane 默认开;globe/periodicX 该向自动关闭) */
   radiation?: boolean;
+  /** 频率频散(仅 v2;Madsen–Sørensen 型混合导数修正,默认关) */
+  dispersion?: boolean;
 }
 
 function minmod(a: number, b: number): number {
@@ -63,6 +65,8 @@ export class CpuSolver {
   manning: number;
   /** 干单元阈值(m) */
   hMin: number;
+  /** 频率频散(仅 v2;Madsen–Sørensen 型混合导数修正,默认关) */
+  dispersion: boolean;
   eta: Float64Array;
   hu: Float64Array;
   hv: Float64Array;
@@ -100,6 +104,7 @@ export class CpuSolver {
     this.damping = o.damping ?? 0.9998;
     this.manning = o.manning ?? MANNING_N;
     this.hMin = o.hMin ?? H_MIN;
+    this.dispersion = o.dispersion ?? false;
     this.radiation = o.radiation ?? !(o.globe ?? false);
     const n = o.nx * o.ny;
     this.H = new Float64Array(n);
@@ -324,6 +329,31 @@ export class CpuSolver {
     const saveE = this.eta, saveU = this.hu, saveV = this.hv;
     this.eta = e; this.hu = u; this.hv = v;
     const { nx, ny, dy, lEta, lHu, lHv, H } = this;
+    // 频散源项辅助:V = −g·h·∇η(q_t 的 SWE 一阶迭代),
+    // S = (h²/3)·∇(∇·V)(Madsen–Sørensen/Peregrine 混合导数项的 η 位势形式,
+    // 与 GPU STEP_FRAG_V2 的 dispersiveSource 同构;行号先 iy 钳制与 cellIdx 一致)
+    const hAt = (idx: number): number => Math.max(H[idx] + e[idx], 0);
+    const vxAt = (i: number, j: number): number => {
+      const jj = this.iy(j);
+      const row = jj * nx;
+      const s = this.kLat[jj];
+      const ip = row + this.ix(i + s), im = row + this.ix(i - s);
+      return (-GRAVITY * hAt(row + this.ix(i)) * (e[ip] - e[im])) / (2 * this.dxEff[row + this.ix(i)]);
+    };
+    const vyAt = (i: number, j: number): number => {
+      const jp = this.iy(j + 1) * nx + this.ix(i);
+      const jm = this.iy(j - 1) * nx + this.ix(i);
+      return (-GRAVITY * hAt(this.iy(j) * nx + this.ix(i)) * (e[jp] - e[jm])) / (2 * dy);
+    };
+    const divAt = (i: number, j: number): number => {
+      const jj = this.iy(j);
+      const s = this.kLat[jj];
+      const dxe = this.dxEff[jj * nx + this.ix(i)];
+      return (
+        (vxAt(i + s, jj) - vxAt(i - s, jj)) / (2 * dxe) +
+        (vyAt(i, jj + 1) - vyAt(i, jj - 1)) / (2 * dy)
+      );
+    };
     for (let j = 0; j < ny; j++) {
       const s = this.kLat[j];   // 缩减纬网 stride(经向界面/源项均用 i±s)
       for (let i = 0; i < nx; i++) {
@@ -348,6 +378,22 @@ export class CpuSolver {
         lEta[k] = -((xp[0] - xm[0]) / dxe + (yp[0] - ym[0]) / dy);
         lHu[k] = -((xp[1] - xm[1]) / dxe + (yp[1] - ym[1]) / dy) + GRAVITY * e[k] * dhdx;
         lHv[k] = -((xp[2] - xm[2]) / dxe + (yp[2] - ym[2]) / dy) + GRAVITY * e[k] * dhdy;
+        // 可选频率频散(阶段一致:两 RK2 阶段各自用本阶段 η 求值)。
+        // 色散关系 ω² = c²k²(1 − coef·k²)(Peregrine 展开形,O(μ²) 与 Padé 一致)。
+        // 系数网格上限:稳定条件 b = coef·k² ≤ 1 须对一切网格模式成立
+        // (kdx = π/2 时 b = coef/dx²),故 coef ≤ 0.6·min(dx,dy)²(1.67× 裕度)。
+        // 全球网格 h/dx ≈ 0.1 ≪ 上限 → 完整 Peregrine 强度(跨洋频散最重要场景);
+        // 近场细网格(h/dx ≳ 1)按稳定上限截断 —— 教学级取舍,无比值削顶(削顶会在
+        // |L| 过零处畸变 S → 谐波级联耗散)。
+        if (this.dispersion) {
+          const h = hAt(k);
+          if (h >= this.hMin) {
+            const dMin = Math.min(dxe, dy);
+            const coef = Math.min((h * h) / 3, 0.6 * dMin * dMin);
+            lHu[k] += (coef * (divAt(i + s, j) - divAt(i - s, j))) / (2 * dxe);
+            lHv[k] += (coef * (divAt(i, j + 1) - divAt(i, j - 1))) / (2 * dy);
+          }
+        }
       }
     }
     this.eta = saveE; this.hu = saveU; this.hv = saveV;

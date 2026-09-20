@@ -10,6 +10,8 @@ export interface SimParams {
   scheme: string;
   /** 曼宁摩擦系数 n(仅 v2;0 关闭,范围 0–0.05) */
   manning: number;
+  /** 频率频散(仅 v2;近场/港湾短波,默认关——跨洋长波场景频散影响小) */
+  dispersion: boolean;
   exaggeration: number;
   colorRange: number;
   waterOpacity: number;
@@ -36,6 +38,7 @@ export interface PanelCallbacks {
   onReset(): void;
   onSchemeChange(scheme: string): void;
   onManningChange(manning: number): void;
+  onDispersionChange(on: boolean): void;
   onRandomQuake(): void;
   onTohokuQuake(): void;
   onExaggerationChange(ex: number): void;
@@ -77,6 +80,7 @@ export function createPanel(cb: PanelCallbacks): PanelHandle {
     timeScale: DEFAULT_TIME_SCALE,
     scheme: 'v2',
     manning: MANNING_N,
+    dispersion: false,
     exaggeration: 3,
     colorRange: 2,
     waterOpacity: 0.8,
@@ -119,6 +123,10 @@ export function createPanel(cb: PanelCallbacks): PanelHandle {
     .add(params, 'manning', 0, 0.05, 0.001)
     .name('曼宁摩擦 n(仅二阶)')
     .onChange((v: number) => cb.onManningChange(v));
+  sim
+    .add(params, 'dispersion')
+    .name('频率频散(近场)')
+    .onChange((v: boolean) => cb.onDispersionChange(v));
   sim.add({ reset: cb.onReset }, 'reset').name('重置海面');
 
   // --- 地震源 ---

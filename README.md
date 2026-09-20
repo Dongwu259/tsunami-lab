@@ -98,6 +98,11 @@ data/globe.tsunami              随包全球地形(±84°,2048×1024 等距圆�
 - **uScheme=0(教学对照)**:一阶 Lax–Friedrichs,最稳定但数值耗散大,保留作旧格式回退
 - **时间步长自动化**:\(\Delta t = 0.5\cdot\min(\Delta x_{\text{eff}},\Delta y)/\sqrt{gH_{\max}}\)(CFL 安全因子 0.5),
   启动时按地形计算,HUD 显示实际 dt
+- **可选频率频散**(面板「频率频散(近场)」,仅二阶格式):动量方程追加
+  Madsen–Sørensen/Peregrine 型混合导数修正 \(S = c_{\text{coef}}\,\nabla(\nabla\cdot(-g\,h\,\nabla\eta))\),
+  色散曲线 \(\omega^2 = c^2k^2(1-c_{\text{coef}}k^2)\);系数 \(c_{\text{coef}}=\min(h^2/3,\,0.6\min(\Delta x_{\text{eff}},\Delta y)^2)\)
+  按网格稳定上限截断(全球网格 h/dx≈0.1 → 完整 Peregrine 强度)。默认关——
+  跨洋长波频散影响小;近场/短波场景开启(实测 μ=kh=0.8 相速误差 ≈1.4%)
 
 ### 边界与极地处理
 
@@ -113,7 +118,8 @@ data/globe.tsunami              随包全球地形(±84°,2048×1024 等距圆�
 
 > **验证**:上述格式的 CPU/TS 镜像([`src/simulation/cpuSolver.ts`](src/simulation/cpuSolver.ts),与 GLSL 逐式同构)
 > 由 [`src/simulation/benchmarks.test.ts`](src/simulation/benchmarks.test.ts) 在 CI 无 WebGL 环境下覆盖:
-> 行波衰减、二阶收敛阶、静水平衡、质量守恒、Green 定律浅水放大、辐射边界反射、缩减纬网极地波速、球面长时稳定性。
+> 行波衰减、二阶收敛阶、静水平衡、质量守恒、Green 定律浅水放大、辐射边界反射、缩减纬网极地波速、球面长时稳定性、
+> 频散色散关系相速与波包扩展。
 >
 > ⚠️ **改求解器数值必须同步 CPU 与 GPU 两份实现**([`cpuSolver.ts`](src/simulation/cpuSolver.ts) ↔ [`shaders.ts`](src/simulation/shaders.ts) 的 `STEP_FRAG`/`STEP_FRAG_V2`):
 > CI 无 WebGL、只跑 CPU 镜像,只改一侧会让 CI「假绿」而实际渲染行为与通过的测试背离。
@@ -180,8 +186,9 @@ data/globe.tsunami              随包全球地形(±84°,2048×1024 等距圆�
 2. 真实目录震源为 Okada 远场主导结构的教学级近似(含多子断层非均匀
    滑量),未含完整弹性位错核(科研模式由 GeoClaw 的 Okada 断层补齐)
 3. 无科氏力、潮汐;底摩擦为曼宁公式的隐式教学级近似(不含随水深/底质变化的粗糙度场)
-4. 无真实动边界 run-up 淹没(干单元以 \(h_{\min}\) 薄膜近似、陆地 η 冻结),港湾级爬高需 GeoClaw 的干湿 AMR
-5. 未含频散(Boussinesq):远场长波主导场景影响小,近场短波频散需专门格式
+4. 无真实动边界 run-up 淹没(干单元以 \(h_{\min}\) 薄膜近似、陆地 η 冻结),港湾级爬高需 GeoClaw 的干湿 AMR(ROADMAP 阶段 5 计划补齐)
+5. 频散为 Madsen–Sørensen/Peregrine 展开形的教学级实现:显式 + 网格稳定上限系数
+   (近场细网格上强度按上限截断;全球/长波网格完整生效);科研级隐式 Boussinesq 由 GeoClaw 补齐
 
 ## 真实地形数据管线
 
@@ -269,8 +276,8 @@ Web 端“科研模式 (GeoClaw)”面板:测试连接 → 设置时长/帧数 �
 - [x] 地震体波可视化(P/S 波圈)
 - [x] 非线性浅水(总水深 + 井平衡源 + 曼宁摩擦)+ 二阶 MUSCL-RK2 低耗散格式
 - [x] 辐射边界(特征投影)+ 缩减纬网极地处理(CPU 镜像 + 数值基准入 CI)
-- [ ] 可选频散(Boussinesq,Madsen–Sørensen 型):近场/港湾短波(ROADMAP 阶段 4)
-- [ ] 完全非线性对流项 + 真实动边界淹没(run-up 统计 + 淹没图层)(ROADMAP 阶段 5)
+- [x] 可选频散(Madsen–Sørensen 型,网格稳定上限系数;CPU 镜像 + 色散基准入 CI)
+- [ ] 干湿 run-up 与淹没可视化(静水重构 + 保正通量 + 累计爬高图层)(ROADMAP 阶段 5)
 - [ ] WebGPU compute 迁移(WebGL2 保留为 fallback,MAX_GRID 384→1024)(ROADMAP 阶段 6)
 - [ ] GeoClaw 结果实时流式回放(边算边看)
 - [ ] 潮位站时间序列曲线(验潮记录仪风格)
